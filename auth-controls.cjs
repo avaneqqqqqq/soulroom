@@ -1,0 +1,1 @@
+const {contextBridge,ipcRenderer}=require('electron');contextBridge.exposeInMainWorld('authControls',{action:value=>ipcRenderer.invoke('auth-window:action',value),onState:callback=>ipcRenderer.on('auth-window:state',(_e,d)=>callback(d))});

@@ -1,0 +1,86 @@
+{
+  "name": "soulroom",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Музыка из твоих сервисов в одном пространстве",
+  "scripts": {
+    "start": "node server/index.mjs",
+    "desktop": "electron desktop.cjs",
+    "test": "node --check dist/app.js && node server/selftest.mjs",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "release:win": "electron-builder --win nsis --x64 --publish always",
+    "test:release": "node --test server/player-regressiontest.mjs server/eqtest.mjs server/experiencetest.mjs server/spotify-usertest.mjs server/auth-capturetest.mjs server/auth-sessiontest.mjs server/update-uitest.mjs"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11",
+    "undici": "^6.29.1"
+  },
+  "devDependencies": {
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0"
+  },
+  "main": "desktop.cjs",
+  "author": "avaneqqqqqq",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avaneqqqqqq/soulroom.git"
+  },
+  "build": {
+    "appId": "com.avane.soulroom",
+    "productName": "soulroom",
+    "asar": false,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "desktop*.cjs",
+      "preload.cjs",
+      "oauth.cjs",
+      "auth-*",
+      "dist/**",
+      "server/**",
+      "build/icon.png",
+      "LICENSE",
+      "package.json",
+      "!server/**/*test*",
+      "!server/**/*mock*",
+      "!server/providers/_probe-*",
+      "!data/**",
+      "!.openai/**",
+      "!.github/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "soulroom-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "soulroom",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "avaneqqqqqq",
+        "repo": "soulroom",
+        "releaseType": "draft"
+      }
+    ]
+  }
+}

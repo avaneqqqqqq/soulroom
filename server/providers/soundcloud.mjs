@@ -1,0 +1,1610 @@
+/**
+ * Провайдер SoundCloud для локального плеера.
+ *
+ * Интерфейс — player/CONTRACT.md §4. Только node:-модули и глобальный fetch,
+ * никаких npm-зависимостей. Все сетевые запросы ограничены таймаутом,
+ * client_id нигде не логируется целиком.
+ *
+ * Как добывается client_id (первый успешный источник побеждает):
+ *   1. settings      — PUT /api/settings → configure({clientId})
+ *   2. env           — SOUNDCLOUD_CLIENT_ID
+ *   3. m.soundcloud.com — в HTML лежит __NEXT_DATA__ c "clientId":"…" (рабочий путь в этой сети)
+ *   4. soundcloud.com   — HTML → бандлы a-v2.sndcdn.com → regex client_id:"…" (как в контракте)
+ *   5. публичные списки client_id (GitHub/HuggingFace) — последний рубеж
+ * Каждый кандидат проверяется реальным запросом к api-v2 и кэшируется на 6 часов;
+ * при 401 от api-v2 кэш сбрасывается и client_id добывается заново.
+ *
+ * stream(): progressive and HLS are downloaded completely through configured transport,
+ * with bounded bytes, requests, concurrency and an absolute per-track deadline.
+ */
+
+import { AsyncLocalStorage } from 'node:async_hooks';
+import * as proxy from '../proxy.mjs';
+import * as sctoken from './sctoken.mjs';
+import * as screlay from './screlay.mjs';
+import * as scProxy from '../scproxy.mjs';
+
+export const id = 'soundcloud';
+
+let transportMode = 'auto';
+const API_ORIGIN = 'https://api-v2.soundcloud.com';
+const DESKTOP_ORIGIN = 'https://soundcloud.com';
+const MOBILE_ORIGIN = 'https://m.soundcloud.com';
+
+const TIMEOUT_MS = 15_000;
+const SCRAPE_TIMEOUT_MS = 12_000;
+const CLIENT_ID_TTL_MS = 6 * 60 * 60 * 1000;
+const CLIENT_ID_FAIL_TTL_MS = 60 * 1000;
+const MAX_CLIENT_ID_CANDIDATES = 10;
+const MAX_BUNDLES = 8;
+const MAX_BUNDLE_BYTES = 6 * 1024 * 1024;
+const MAX_LIST_BYTES = 3 * 1024 * 1024;
+
+// Буфер HLS ограничен, чтобы 2-часовой DJ-сет не съел всю память.
+const MAX_HLS_BYTES = 120 * 1024 * 1024;
+const MAX_HLS_SEGMENTS = 4000;
+const HLS_CONCURRENCY = 3;
+const TRACK_TIMEOUT_MS = 90_000;
+const MAX_MEDIA_REQUESTS = 512;
+const requestScope = new AsyncLocalStorage();
+
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const CLIENT_ID_FORMAT = /^[0-9a-zA-Z]{32}$/;
+
+// clientId (мобильный сайт), client_id (десктопные бандлы), client_id=… (URL внутри JS).
+const CLIENT_ID_PATTERNS = [
+  /client_?id["']?\s*[:=]\s*["']([0-9a-zA-Z]{32})["']/gi,
+  /client_?id=([0-9a-zA-Z]{32})/gi,
+];
+
+// protocols, которые мы умеем отдавать. ctr/cbc-encrypted-hls не поддерживаем:
+// такие треки помечаются playable:false / not_streamable.
+const SUPPORTED_PROTOCOLS = new Set(['progressive', 'hls']);
+
+// Публичные списки client_id — используются только если оба сайта недоступны.
+const PUBLIC_CLIENT_ID_LISTS = [
+  'https://huggingface.co/spaces/shadowx77/shadow-music-api/raw/main/app.py',
+];
+
+/* ------------------------------------------------------------------ */
+/* состояние                                                           */
+/* ------------------------------------------------------------------ */
+
+let configuredClientId = '';
+// ссылка на профиль из настроек: по ней ищем лайки и плейлисты
+let configuredProfile = '';
+// cookie сессии после входа в аккаунт: дают доступ к лайкам и плейлистам
+let configuredCookies = '';
+
+let validatedClientId = '';
+let clientIdSource = '';
+let clientIdAt = 0;
+let acquirePromise = null;
+let lastAcquire = null;
+
+/**
+ * Когда SoundCloud перестанет ограничивать частоту.
+ *
+ * Если запросов слишком много (перемотка, повтор трека, быстрый переход
+ * между треками), api-v2 отвечает 429 и поток не собирается вообще.
+ * Запоминаем время и на несколько секунд притормаживаем сами, вместо
+ * того чтобы долбить сервис и получать отказы.
+ */
+let rateLimitedUntil = 0;
+
+/** Последнее известное состояние лимита (заголовки SoundCloud). */
+let rateLimit = null;
+
+/**
+ * Кэш готовых потоков: id трека → {value, at}.
+ *
+ * Ссылка на аудио живёт не меньше часа, а без кэша каждый повтор и
+ * перемотка дёргали сервер заново. При частых запросах SoundCloud
+ * отвечает 429, и трек перестаёт играть вовсе.
+ */
+const streamCache = new Map();
+const STREAM_CACHE_TTL_MS = 30 * 60 * 1000;
+const STREAM_CACHE_MAX = 60;
+
+/**
+ * Кэш подписанных адресов потока.
+ *
+ * Один вызов = один запрос из суточного лимита (1500 запросов потока).
+ * Подписанный адрес живёт час и больше, поэтому храним его: повтор трека,
+ * перемотка и возврат назад не тратят лимит заново. Без этого человек
+ * сгорал лимит за несколько часов прослушивания.
+ */
+const resolvedUrlCache = new Map();
+const RESOLVED_URL_TTL_MS = 45 * 60 * 1000;
+const RESOLVED_URL_MAX = 100;
+
+let lastFailError = null;
+let lastFailAt = 0;
+
+/* ------------------------------------------------------------------ */
+/* ошибки в формате контракта {code, message}                          */
+/* ------------------------------------------------------------------ */
+
+function fail(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.message = message;
+  return error;
+}
+
+function safeHost(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url);
+  }
+}
+
+function networkMessage(url, error, timeout) {
+  const name = String(error?.name || '');
+  const code = String(error?.cause?.code || error?.code || '');
+  const host = safeHost(url);
+  if (name === 'TimeoutError' || name === 'AbortError' || /TIMEOUT/i.test(code)) {
+    return `SoundCloud: ${host} не ответил за ${timeout} мс`;
+  }
+  return `SoundCloud: сетевая ошибка при обращении к ${host}${code ? ` (${code})` : ''}`;
+}
+
+function maskClientId(value) {
+  const text = String(value || '');
+  if (!text) return '(нет)';
+  if (text.length <= 6) return `${text.slice(0, 2)}***`;
+  return `${text.slice(0, 4)}***${text.slice(-2)}`;
+}
+
+function clampInt(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(number)));
+}
+
+/* ------------------------------------------------------------------ */
+/* сетевые примитивы                                                   */
+/* ------------------------------------------------------------------ */
+
+function checkCancelled() {
+  requestScope.getStore()?.signal.throwIfAborted();
+}
+async function pause(ms) {
+  const signal = requestScope.getStore()?.signal;
+  checkCancelled();
+  await new Promise((resolve, reject) => {
+    const done = () => { signal?.removeEventListener('abort', abort); resolve(); };
+    const timer = setTimeout(done, ms);
+    const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+// Consume the body INSIDE the transport attempt: header-only success is not
+// success when a CDN stalls midway. Failed attempts are cancelled before fallback.
+async function httpFetch(url, { method = 'GET', headers = {}, body, timeout = TIMEOUT_MS, consume } = {}) {
+  const scope = requestScope.getStore();
+  checkCancelled();
+  const requestHeaders = new Headers({ 'user-agent': USER_AGENT, 'accept-language': 'en-US,en;q=0.9', ...headers });
+  const sensitive = requestHeaders.has('authorization') || requestHeaders.has('cookie')
+    || /(?:oauth|access_token|refresh_token)=/i.test(String(url)) || Boolean(body);
+  if (sensitive && new URL(url).origin !== API_ORIGIN) throw fail('AUTH_FAILED', 'SoundCloud: небезопасный адрес авторизованного запроса');
+  const perform = async requestUrl => {
+    checkCancelled();
+    if (scope && ++scope.budget.requests > MAX_MEDIA_REQUESTS) throw fail('NOT_SUPPORTED', 'SoundCloud: превышен бюджет запросов трека');
+    const controller = new AbortController();
+    const signal = scope ? AbortSignal.any([scope.signal, controller.signal]) : controller.signal;
+    const timer = setTimeout(() => controller.abort(new DOMException('Body deadline exceeded', 'TimeoutError')), timeout);
+    let response;
+    try {
+      const dispatcher = proxy.soundcloudDispatcher();
+      response = await fetch(requestUrl, { method, headers: requestHeaders, body,
+        // Do not follow authenticated redirects to another host (or a public relay).
+        redirect: sensitive ? 'error' : 'follow', signal, ...(dispatcher ? { dispatcher } : {}) });
+      if (response.status >= 500) throw fail('UPSTREAM', 'SoundCloud HTTP ' + response.status);
+      return consume ? await consume(response, signal) : response;
+    } catch (error) {
+      controller.abort(error);
+      try { await response?.body?.cancel(); } catch { /* reader may own the lock */ }
+      throw error;
+    } finally { clearTimeout(timer); }
+  };
+  const attempt = async () => {
+    if (!sensitive && screlay.hasRelay() && (transportMode === 'relay' || (transportMode === 'auto' && screlay.list().working))) {
+      try { return await screlay.through(url, perform); }
+      catch (error) { checkCancelled(); if (transportMode === 'relay') throw error; }
+    }
+    try { return await perform(url); }
+    catch (error) {
+      checkCancelled();
+      if (error.code === 'NOT_SUPPORTED') throw error;
+      // OAuth credentials must never reach a third-party public relay.
+      if (!sensitive && transportMode !== 'direct' && screlay.hasRelay()) return screlay.through(url, perform);
+      throw error;
+    }
+  };
+  try { return await attempt(); }
+  catch (error) {
+    checkCancelled();
+    if (error.code === 'NOT_SUPPORTED') throw error;
+    // Media requests have a bounded transport budget; proxy recovery may run its
+    // own background probes, so only non-media calls may trigger it.
+    if (!scope && await scProxy.recover(error)) {
+      try { return await attempt(); }
+      catch (retryError) { throw fail('UPSTREAM', networkMessage(url, retryError, timeout)); }
+    }
+    if (error.code === 'UPSTREAM') throw error;
+    throw fail('UPSTREAM', networkMessage(url, error, timeout));
+  }
+}
+async function boundedBody(response, signal, maxBytes) {
+  const declared = Number(response.headers.get('content-length') || 0);
+  if (declared > maxBytes) {
+    await response.body?.cancel();
+    throw fail('NOT_SUPPORTED', 'SoundCloud: ответ превышает лимит буфера');
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const chunks = [];
+  let size = 0;
+  const abort = () => { void reader.cancel(signal.reason).catch(() => {}); };
+  signal.addEventListener('abort', abort, { once: true });
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) throw fail('NOT_SUPPORTED', 'SoundCloud: ответ превышает лимит буфера');
+      chunks.push(Buffer.from(value));
+    }
+    if (declared && declared !== size) throw fail('UPSTREAM', 'SoundCloud: неполный ответ');
+    return Buffer.concat(chunks, size);
+  } finally {
+    signal.removeEventListener('abort', abort);
+    try { await reader.cancel(); } catch { /* closed/aborted */ }
+    reader.releaseLock();
+  }
+}
+async function httpText(url, { method = 'GET', headers = {}, body, timeout = TIMEOUT_MS, maxBytes = MAX_LIST_BYTES } = {}) {
+  return httpFetch(url, { method, headers, body, timeout, consume: async (response, signal) => ({
+    ok: response.ok, status: response.status, headers: response.headers,
+    body: (await boundedBody(response, signal, maxBytes || MAX_LIST_BYTES)).toString('utf8'),
+  }) });
+}
+// One GET per segment, no HEAD plus tiny serial ranges and no retry multiplier.
+// A complete 200 is valid. An unsolicited partial 206 is never complete media.
+async function httpBuffer(url, { headers = {}, timeout = TIMEOUT_MS, maxBytes = MAX_HLS_BYTES } = {}) {
+  return httpFetch(url, { headers, timeout, consume: async (response, signal) => {
+    if (response.status === 206) throw fail('UPSTREAM', 'SoundCloud: неожиданный частичный ответ CDN');
+    return { ok: response.ok, status: response.status, headers: response.headers,
+      buffer: await boundedBody(response, signal, maxBytes) };
+  } });
+}
+
+/* ------------------------------------------------------------------ */
+/* добыча client_id                                                    */
+/* ------------------------------------------------------------------ */
+
+function extractClientIds(text) {
+  const found = [];
+  for (const pattern of CLIENT_ID_PATTERNS) {
+    for (const match of String(text).matchAll(pattern)) {
+      const value = match[1];
+      if (CLIENT_ID_FORMAT.test(value) && !found.includes(value)) found.push(value);
+    }
+  }
+  return found;
+}
+
+async function scrapeHtmlClientIds(url) {
+  const page = await httpText(url, {
+    timeout: SCRAPE_TIMEOUT_MS,
+    headers: { accept: 'text/html,application/xhtml+xml' },
+  });
+  if (!page.ok) throw fail('UPSTREAM', `SoundCloud: ${safeHost(url)} ответил HTTP ${page.status}`);
+  return extractClientIds(page.body);
+}
+
+function scriptSrcs(html) {
+  const urls = [];
+  const matches = String(html).matchAll(/<script[^>]+src=["']([^"']+)["']/gi);
+  for (const match of matches) {
+    let value = match[1].trim();
+    if (!value) continue;
+    if (value.startsWith('//')) value = `https:${value}`;
+    else if (!/^https?:/i.test(value)) {
+      try {
+        value = new URL(value, DESKTOP_ORIGIN).toString();
+      } catch {
+        continue;
+      }
+    }
+    if (/sndcdn\.com\//i.test(value) && !urls.includes(value)) urls.push(value);
+  }
+  // Бандлы a-v2 — те, что указаны в контракте; остальные sndcdn идут после.
+  urls.sort((a, b) => Number(b.includes('a-v2.sndcdn.com')) - Number(a.includes('a-v2.sndcdn.com')));
+  return urls;
+}
+
+/** Путь из контракта: HTML soundcloud.com → бандлы a-v2.sndcdn.com → regex client_id. */
+async function scrapeDesktopClientIds() {
+  const page = await httpText(`${DESKTOP_ORIGIN}/`, {
+    timeout: SCRAPE_TIMEOUT_MS,
+    headers: { accept: 'text/html,application/xhtml+xml' },
+  });
+  if (!page.ok) throw fail('UPSTREAM', `SoundCloud: soundcloud.com ответил HTTP ${page.status}`);
+
+  const inline = extractClientIds(page.body);
+  if (inline.length) return inline;
+
+  const bundles = scriptSrcs(page.body).slice(0, MAX_BUNDLES);
+  for (const bundleUrl of bundles) {
+    try {
+      const bundle = await httpText(bundleUrl, {
+        timeout: SCRAPE_TIMEOUT_MS,
+        maxBytes: MAX_BUNDLE_BYTES,
+        headers: { accept: '*/*' },
+      });
+      if (!bundle.ok) continue;
+      const found = extractClientIds(bundle.body);
+      if (found.length) return found;
+    } catch {
+      // один битый бандл не должен ломать весь скрейп
+    }
+  }
+  return [];
+}
+
+async function scrapePublicClientIds() {
+  const found = [];
+  for (const url of PUBLIC_CLIENT_ID_LISTS) {
+    try {
+      const response = await httpText(url, { timeout: SCRAPE_TIMEOUT_MS, maxBytes: MAX_LIST_BYTES });
+      if (!response.ok) continue;
+      for (const value of extractClientIds(response.body)) {
+        if (!found.includes(value)) found.push(value);
+      }
+    } catch {
+      // источник недоступен — пробуем следующий
+    }
+    if (found.length) break;
+  }
+  return found;
+}
+
+async function validateClientId(value) {
+  const url = new URL('/search/tracks', API_ORIGIN);
+  url.searchParams.set('q', 'soundcloud');
+  url.searchParams.set('limit', '1');
+  url.searchParams.set('client_id', value);
+  try {
+    const response = await httpText(url.toString(), {
+      timeout: TIMEOUT_MS,
+      headers: { accept: 'application/json' },
+    });
+    if (response.status !== 200) return false;
+    const data = JSON.parse(response.body);
+    return Array.isArray(data?.collection);
+  } catch {
+    return false;
+  }
+}
+
+function configuredProfileUrl() {
+  return String(configuredProfile || process.env.SOUNDCLOUD_PROFILE || '').trim();
+}
+
+function setClientId(value, source) {
+  validatedClientId = value;
+  clientIdSource = source;
+  clientIdAt = Date.now();
+  lastFailError = null;
+  lastFailAt = 0;
+}
+
+function invalidateClientId() {
+  validatedClientId = '';
+  clientIdAt = 0;
+}
+
+export async function acquireClientId() {
+  const startedAt = Date.now();
+  const deadline = startedAt + 25_000;
+  const attempts = [];
+  const candidates = [];
+  const addCandidate = (value, source) => {
+    const text = String(value || '').trim();
+    if (!CLIENT_ID_FORMAT.test(text)) return;
+    if (candidates.some((candidate) => candidate.value === text)) return;
+    candidates.push({ value: text, source });
+  };
+
+  // 1-2: настройки и переменная окружения
+  addCandidate(configuredClientId, 'settings');
+  addCandidate(process.env.SOUNDCLOUD_CLIENT_ID, 'env');
+
+  // Validate explicit settings/env before downloading any website bundles.
+  for (const candidate of candidates) {
+    const valid = await validateClientId(candidate.value);
+    attempts.push({ source: candidate.source, ok: valid, detail: maskClientId(candidate.value) });
+    candidate.checked = true;
+    if (valid) {
+      setClientId(candidate.value, candidate.source);
+      lastAcquire = { ok: true, at: new Date().toISOString(), ms: Date.now() - startedAt,
+        source: candidate.source, masked: maskClientId(candidate.value), attempts };
+      return candidate.value;
+    }
+  }
+
+  // 3: мобильный сайт — единственный публичный хост SoundCloud, открывающийся в этой сети
+  if (Date.now() < deadline) {
+    try {
+      const ids = await scrapeHtmlClientIds(`${MOBILE_ORIGIN}/`);
+      attempts.push({ source: 'scrape m.soundcloud.com', ok: ids.length > 0, detail: `кандидатов: ${ids.length}` });
+      for (const value of ids) addCandidate(value, 'scrape m.soundcloud.com');
+    } catch (error) {
+      attempts.push({ source: 'scrape m.soundcloud.com', ok: false, detail: error.message });
+    }
+  }
+
+  // 4: десктопный сайт + бандлы a-v2.sndcdn.com
+  if (Date.now() < deadline) {
+    try {
+      const ids = await scrapeDesktopClientIds();
+      attempts.push({ source: 'scrape soundcloud.com', ok: ids.length > 0, detail: `кандидатов: ${ids.length}` });
+      for (const value of ids) addCandidate(value, 'scrape soundcloud.com');
+    } catch (error) {
+      attempts.push({ source: 'scrape soundcloud.com', ok: false, detail: error.message });
+    }
+  }
+
+  // 5: публичные списки
+  if (Date.now() < deadline) {
+    try {
+      const ids = await scrapePublicClientIds();
+      attempts.push({ source: 'public client_id lists', ok: ids.length > 0, detail: `кандидатов: ${ids.length}` });
+      for (const value of ids) addCandidate(value, 'public client_id lists');
+    } catch (error) {
+      attempts.push({ source: 'public client_id lists', ok: false, detail: error.message });
+    }
+  }
+
+  // Проверяем кандидатов по одному живым запросом к api-v2.
+  for (const candidate of candidates.filter(c => !c.checked).slice(0, MAX_CLIENT_ID_CANDIDATES)) {
+    const valid = await validateClientId(candidate.value);
+    attempts.push({
+      source: candidate.source,
+      ok: valid,
+      detail: `${maskClientId(candidate.value)}${valid ? ' принят' : ' отклонён'}`,
+    });
+    if (!valid) continue;
+    setClientId(candidate.value, candidate.source);
+    lastAcquire = {
+      ok: true,
+      at: new Date().toISOString(),
+      ms: Date.now() - startedAt,
+      source: candidate.source,
+      masked: maskClientId(candidate.value),
+      attempts,
+    };
+    return candidate.value;
+  }
+
+  const error = fail(
+    'AUTH_FAILED',
+    'SoundCloud: не удалось получить рабочий client_id (сайты недоступны, ни один найденный ключ не принят)',
+  );
+  lastFailError = error;
+  lastFailAt = Date.now();
+  lastAcquire = {
+    ok: false,
+    at: new Date().toISOString(),
+    ms: Date.now() - startedAt,
+    attempts,
+    error: { code: error.code, message: error.message },
+  };
+  throw error;
+}
+
+async function getClientId(force = false) {
+  checkCancelled();
+  if (!force) {
+    if (validatedClientId && Date.now() - clientIdAt < CLIENT_ID_TTL_MS) return validatedClientId;
+    if (lastFailError && Date.now() - lastFailAt < CLIENT_ID_FAIL_TTL_MS) throw lastFailError;
+  }
+  // A per-track acquisition must not share an uncancellable background promise.
+  if (requestScope.getStore()) return acquireClientId();
+  if (!acquirePromise) {
+    acquirePromise = acquireClientId().finally(() => {
+      acquirePromise = null;
+    });
+  }
+  return acquirePromise;
+}
+
+/* ------------------------------------------------------------------ */
+/* api-v2                                                              */
+/* ------------------------------------------------------------------ */
+
+/** Токен из сохранённых cookie после входа (oauth_token). */
+/** Токен из сохранённых cookie после входа (oauth_token). */
+function readCookieValue(name) {
+  if (!configuredCookies) return '';
+  try {
+    const list = JSON.parse(configuredCookies);
+    const found = list.find((item) => new RegExp(`^${name}$`, 'i').test(item.name || '') && item.value);
+    return found ? String(found.value) : '';
+  } catch {
+    return '';
+  }
+}
+
+function oauthToken() {
+  return readCookieValue('oauth_token');
+}
+
+/** Ключ обновления: им продлеваем токен без участия пользователя. */
+function refreshToken() {
+  return readCookieValue('oauth_refresh_token');
+}
+
+/**
+ * Время до конца жизни токена и признак скорого истечения.
+ * Отдаётся в статусе, чтобы интерфейс мог предупредить.
+ */
+export function tokenInfo() {
+  const token = oauthToken();
+  const info = sctoken.decodeToken(token);
+  if (!info) return { jwt: false, expiresAt: 0, leftMs: 0, needsRefresh: false };
+  const leftMs = Math.max(0, info.exp - Date.now());
+  return {
+    jwt: true,
+    expiresAt: info.exp,
+    leftMs,
+    needsRefresh: sctoken.needsRefresh(token),
+    expired: sctoken.isExpired(token),
+    hasRefresh: Boolean(refreshToken()),
+  };
+}
+
+/**
+ * Продлить токен, если срок подходит к концу.
+ *
+ * Вызывается перед каждым обращением к API. Если refresh_token есть, а
+ * токен скоро истечёт — обновляем молча. Ошибку не выбрасываем наружу:
+ * вызывающий код просто пойдёт со старым токеном и, если тот уже не
+ * работает, получит 401 — это обработается выше.
+ *
+ * @returns {Promise<boolean>} обновили ли
+ */
+async function ensureFreshToken() {
+  const token = oauthToken();
+  if (!token) return false;
+  if (!sctoken.needsRefresh(token)) return false;
+
+  const refresh = refreshToken();
+  if (!refresh) return false;
+
+  // другой запрос уже обновляет — не дублируем
+  if (tokenRefreshPromise) return tokenRefreshPromise;
+
+  tokenRefreshPromise = (async () => {
+    try {
+      const next = await sctoken.refreshTokens({ refreshToken: refresh, accessToken: token });
+      // подменяем оба токена в сохранённых cookie
+      replaceTokensInCookies(next.accessToken, next.refreshToken);
+      log?.('токен SoundCloud обновлён автоматически');
+      return true;
+    } catch (error) {
+      console.warn(`[soundcloud] автообновление токена: ${error.message}`);
+      return false;
+    } finally {
+      tokenRefreshPromise = null;
+    }
+  })();
+
+  return tokenRefreshPromise;
+}
+
+let tokenRefreshPromise = null;
+
+/**
+ * Записать новые токены в сохранённые cookie и на диск.
+ *
+ * Список cookie хранится строкой JSON; меняем в нём значения
+ * oauth_token и oauth_refresh_token, остальное не трогаем.
+ */
+function replaceTokensInCookies(accessToken, newRefresh) {
+  if (!configuredCookies) return;
+  try {
+    const list = JSON.parse(configuredCookies);
+    let changed = false;
+
+    for (const item of list) {
+      if (/^oauth_token$/i.test(item.name || '')) {
+        if (item.value !== accessToken) { item.value = accessToken; changed = true; }
+      } else if (/^oauth_refresh_token$/i.test(item.name || '') && newRefresh) {
+        if (item.value !== newRefresh) { item.value = newRefresh; changed = true; }
+      }
+    }
+
+    if (!changed) return;
+    configuredCookies = JSON.stringify(list);
+
+    // сохраняем на диск, иначе после перезапуска вернёмся к старому токену
+    onTokensChanged?.(configuredCookies);
+  } catch (error) {
+    console.warn(`[soundcloud] не удалось сохранить обновлённый токен: ${error.message}`);
+  }
+}
+
+/** Колбэк из сервера: записать новые cookie в настройки. */
+let onTokensChanged = null;
+
+export function setTokenSaver(handler) {
+  onTokensChanged = typeof handler === 'function' ? handler : null;
+}
+
+function log(message) {
+  try { console.log(`[soundcloud] ${message}`); } catch { /* ignore */ }
+}
+
+
+/**
+ * Заголовки авторизации для api-v2.
+ *
+ * SoundCloud принимает вход ТОЛЬКО в виде `Authorization: OAuth <oauth_token>` —
+ * с одной cookie API отвечает 401. Проверено на живом аккаунте.
+ */
+function authHeader() {
+  const token = oauthToken();
+  return token ? { authorization: `OAuth ${token}` } : {};
+}
+
+/** Cookie тоже отправляем: часть эндпоинтов ориентируется на неё. */
+function cookieHeader() {
+  if (!configuredCookies) return {};
+  try {
+    const list = JSON.parse(configuredCookies);
+    const pairs = list
+      .filter((item) => item && item.name && item.domain?.includes('soundcloud'))
+      .map((item) => `${item.name}=${item.value}`);
+    return pairs.length ? { cookie: pairs.join('; ') } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Есть ли вход в аккаунт. */
+export function hasSession() {
+  return Boolean(oauthToken());
+}
+
+function apiUrl(pathname, params = {}) {
+  const url = new URL(pathname, API_ORIGIN);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+async function callApi(pathname, params, clientId) {
+  const url = apiUrl(pathname, params);
+  // Пустой client_id нельзя ставить в URL: сервер получает `?client_id=` и
+  // отвечает 401 даже при валидном Authorization: OAuth.
+  if (clientId) url.searchParams.set('client_id', clientId);
+  return httpText(url.toString(), {
+    timeout: TIMEOUT_MS,
+    headers: { accept: 'application/json', ...authHeader() },
+  });
+}
+
+function parseApiResponse(response) {
+  if (!response?.ok) throw Object.assign(fail('UPSTREAM', `SoundCloud HTTP ${response?.status || 0}`), { status: response?.status });
+  try { return JSON.parse(response.body); }
+  catch { throw fail('UPSTREAM', 'SoundCloud вернул некорректный JSON'); }
+}
+
+async function apiJson(pathname, params = {}, { retry = true } = {}) {
+  /*
+   * Перед каждым обращением к API продлеваем токен, если срок подходит
+   * к концу. SoundCloud отдаёт токен на сутки; без этого через сутки
+   * звук перестаёт идти и человеку приходилось входить заново.
+   */
+  checkCancelled();
+  if (!requestScope.getStore()) await ensureFreshToken();
+  /*
+   * Порядок попыток подобран по опыту живых тестов:
+   *
+   *   1. С сохранённым входом (OAuth) — самый надёжный путь: работает,
+   *      даже когда client_id не добывается.
+   *   2. С client_id — запасной, нужен для потоков и поиска.
+   *   3. Повтор при временной ошибке сети: соединение через обход часто
+   *      рвётся на первом пакете, со второй попытки проходит.
+   *
+   * 5xx (500/502/503) — временная поломка на стороне SoundCloud,
+   * а не отказ. Их тоже повторяем, но чуть подождав.
+   */
+  const attempts = [];
+
+  if (oauthToken()) attempts.push(() => callApi(pathname, params, ''));
+  attempts.push(async () => {
+    const clientId = await getClientId();
+    return callApi(pathname, params, clientId);
+  });
+
+  let lastResponse = null;
+
+  for (let round = 1; round <= 3; round += 1) {
+    for (const attempt of attempts) {
+      checkCancelled();
+      let response;
+      try {
+        response = await attempt();
+      } catch (error) {
+        // сетевой сбой — пробуем дальше
+        lastResponse = null;
+        continue;
+      }
+
+      // успех
+      if (response.ok) {
+        try {
+          return JSON.parse(response.body);
+        } catch {
+          throw fail('UPSTREAM', 'SoundCloud вернул некорректный JSON');
+        }
+      }
+
+      // постоянные отказы: повторять бессмысленно
+      if (response.status === 404) throw fail('NOT_FOUND', 'SoundCloud: трек не найден');
+      if (response.status === 403) throw fail('NOT_PLAYABLE', 'SoundCloud запретил доступ к треку (HTTP 403)');
+
+      // 401 — ключ протух: сбрасываем и пробуем следующий путь
+      if (response.status === 401) {
+        invalidateClientId();
+        lastResponse = response;
+        continue;
+      }
+
+      // 429 и 5xx — временные, ждём и повторяем
+      lastResponse = response;
+    }
+
+    // пауза растёт: 400 мс, 800 мс
+    await pause(400 * round);
+  }
+
+  if (lastResponse?.status === 401) throw fail('AUTH_FAILED', 'SoundCloud отклонил ключ доступа (HTTP 401)');
+  if (lastResponse?.status === 429) throw fail('UPSTREAM', 'SoundCloud ограничил частоту запросов (HTTP 429)');
+  if (lastResponse) throw fail('UPSTREAM', `SoundCloud ответил HTTP ${lastResponse.status}`);
+  throw fail('UPSTREAM', 'SoundCloud не ответил: сеть недоступна');
+}
+
+function normalizeSourceId(sourceId) {
+  const value = String(sourceId ?? '')
+    .trim()
+    .replace(/^soundcloud:/i, '');
+  if (!/^\d+$/.test(value)) throw fail('BAD_REQUEST', 'Некорректный SoundCloud id трека');
+  return value;
+}
+
+/**
+ * Метаданные трека с повтором.
+ *
+ * Через обход блокировки первые соединения к api-v2 часто обрываются
+ * (таймаут или ECONNRESET), а третья попытка проходит за доли секунды.
+ * Без повтора это выглядело как «не удалось получить звук с сервера».
+ */
+async function fetchTrackRaw(sourceId) {
+  const trackId = normalizeSourceId(sourceId);
+
+  // кэш: повтор трека и перемотка не дёргают сервер заново,
+  // иначе при частых запросах приходит 429 и звук пропадает
+  const cached = streamCache.get(trackId);
+  if (cached && Date.now() - cached.at < STREAM_CACHE_TTL_MS) return cached.value;
+
+  const raw = await withRetry(() => apiJson(`/tracks/${encodeURIComponent(trackId)}`), 4);
+
+  if (streamCache.size >= STREAM_CACHE_MAX) {
+    streamCache.delete(streamCache.keys().next().value);
+  }
+  streamCache.set(trackId, { value: raw, at: Date.now() });
+
+  return raw;
+}
+
+/* ------------------------------------------------------------------ */
+/* маппинг Track                                                       */
+/* ------------------------------------------------------------------ */
+
+function upgradeArtworkUrl(url) {
+  if (!url) return null;
+  const text = String(url);
+  if (/-t\d+x\d+\./i.test(text)) return text;
+  return text.replace(/-large(\.[a-z]+)(\?.*)?$/i, '-t500x500$1$2');
+}
+
+function artistsOf(raw) {
+  const names = [];
+  const user = raw?.user?.username;
+  if (user) names.push(String(user));
+  const metaArtist = raw?.publisher_metadata?.artist;
+  if (metaArtist && !names.some((name) => name.toLowerCase() === String(metaArtist).toLowerCase())) {
+    names.push(String(metaArtist));
+  }
+  return names.length ? names : ['Неизвестный исполнитель'];
+}
+
+function availabilityOf(raw) {
+  const policy = String(raw?.policy || '').toUpperCase();
+  const monetization = String(raw?.monetization_model || '').toUpperCase();
+  const transcodings = Array.isArray(raw?.media?.transcodings) ? raw.media.transcodings : [];
+
+  if (raw?.streamable === false) return { playable: false, reason: 'not_streamable' };
+  if (policy === 'SNIP' || monetization.startsWith('SUB_HIGH_TIER')) {
+    return { playable: false, reason: 'go_plus' };
+  }
+  if (raw?.access === 'blocked' || policy === 'BLOCK') return { playable: false, reason: 'geo' };
+
+  const usable = transcodings.some((transcoding) => {
+    const protocol = String(transcoding?.format?.protocol || '').toLowerCase();
+    return !transcoding?.snipped && SUPPORTED_PROTOCOLS.has(protocol);
+  });
+  if (!usable) return { playable: false, reason: 'not_streamable' };
+
+  return { playable: true, reason: null };
+}
+
+function mapTrack(raw) {
+  const availability = availabilityOf(raw);
+  const durationMs = Number(raw?.full_duration || raw?.duration || 0);
+  return {
+    id: `soundcloud:${raw.id}`,
+    source: 'soundcloud',
+    sourceId: String(raw.id),
+    // id пользователя-исполнителя: нужен для страницы исполнителя
+    artistId: raw?.user?.id != null ? String(raw.user.id) : null,
+    artistList: raw?.user?.id
+      ? [{ id: String(raw.user.id), name: String(raw.user.username || '') }]
+      : [],
+    title: String(raw.title || '').trim() || 'Без названия',
+    artists: artistsOf(raw),
+    album: raw?.publisher_metadata?.album_title ? String(raw.publisher_metadata.album_title) : null,
+    cover: upgradeArtworkUrl(raw?.artwork_url) || upgradeArtworkUrl(raw?.user?.avatar_url),
+    duration: Math.max(0, Math.round(durationMs / 1000)),
+    playable: availability.playable,
+    reason: availability.reason,
+    explicit: Boolean(raw?.publisher_metadata?.explicit ?? raw?.explicit ?? false),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* публичный интерфейс провайдера                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @param {{clientId?: string}} [cfg] настройки источника (PUT /api/settings)
+ */
+export function configure(cfg = {}) {
+  /*
+   * Public relays are a best-effort fallback for unauthenticated requests.
+   * They do not guarantee playback or replace provider access restrictions;
+   * authenticated requests must never be forwarded to them.
+   */
+  screlay.configure(cfg?.relays ?? screlay.DEFAULT_RELAYS);
+  transportMode = ['auto','direct','relay'].includes(cfg.transportMode) ? cfg.transportMode : 'auto';
+
+  // профиль нужен и для лайков, и для плейлистов — запоминаем его всегда
+  configuredProfile = typeof cfg?.profileUrl === 'string' ? cfg.profileUrl.trim() : configuredProfile;
+  configuredCookies = typeof cfg?.cookies === 'string' ? cfg.cookies : configuredCookies;
+
+  const next = typeof cfg?.clientId === 'string' ? cfg.clientId.trim() : '';
+  if (next === configuredClientId) return;
+  configuredClientId = next;
+  // Пользовательский ключ имеет приоритет: сбрасываем прежний кэш.
+  invalidateClientId();
+  lastFailError = null;
+  lastFailAt = 0;
+}
+
+/** Диагностика: какой client_id используется и откуда он взят. */
+export function clientIdInfo() {
+  return {
+    configured: Boolean(configuredClientId),
+    validated: Boolean(validatedClientId),
+    source: clientIdSource || null,
+    acquiredAt: clientIdAt || null,
+  };
+}
+
+/**
+ * Запрос с повтором при сетевом сбое.
+ *
+ * api-v2.soundcloud.com периодически обрывает соединение (ECONNRESET,
+ * «fetch failed») — особенно при параллельных запросах. Один повтор через
+ * короткую паузу почти всегда проходит, и пользователь больше не видит
+ * «сетевая ошибка» на странице исполнителя.
+ */
+async function withRetry(run, attempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    checkCancelled();
+    try {
+      return await run(attempt);
+    } catch (error) {
+      lastError = error;
+      const code = String(error?.code || error?.cause?.code || '');
+      const retryable = /UPSTREAM|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|fetch failed|network/i.test(`${code} ${error?.message || ''}`);
+      if (!retryable || attempt === attempts) break;
+      await pause(220 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Статус сервиса.
+ *
+ * Проверяемся в два шага:
+ *   1) если есть вход через аккаунт (oauth_token), сервис рабочий —
+ *      client_id для этого не нужен, поиск и прослушивание идут через
+ *      `Authorization: OAuth`;
+ *   2) иначе пробуем добыть client_id.
+ *
+ * Раньше проверялся ТОЛЬКО client_id, и при любом сбое его добычи
+ * интерфейс показывал «токен не подошёл», хотя аккаунт подключён.
+ */
+export async function status() {
+  // остаток лимита — чтобы показать его в интерфейсе рядом со статусом
+  const limit = rateLimitState();
+
+  // вход через аккаунт — самый надёжный признак работоспособности
+  if (oauthToken()) {
+    try {
+      const authorized = await callApi('/me', {}, '');
+      if (authorized.ok) return { connected:true,accountConnected:true,rateLimit:limit };
+      if ([401,403].includes(authorized.status)) return {connected:false,accountConnected:false,error:authorized.status===401?'AUTH_EXPIRED':'AUTH_FORBIDDEN',rateLimit:limit};
+    } catch {
+      // сеть подвела — пробуем дальше через client_id
+    }
+  }
+
+  // A public catalog response cannot verify a saved user account.
+  if (oauthToken()) return {connected:false,pending:true,accountConnected:false,error:'CHECK_NETWORK',rateLimit:limit};
+
+  try {
+    await getClientId();
+    return { connected: true };
+  } catch (error) {
+    // client_id не добылся, но сохранённая сессия осталась — это
+    // рабочее состояние, а не ошибка
+    if (oauthToken()) {
+      return {connected:false,pending:true,accountConnected:false,error:'CHECK_NETWORK',note:'Сессия сохранена, но доступ к аккаунту пока не подтверждён',rateLimit:limit};
+    }
+    return {
+      connected: false,
+      error: { code: error.code || 'UPSTREAM', message: error.message },
+      rateLimit: limit,
+    };
+  }
+}
+
+/**
+ * @param {string} query
+ * @param {number} [limit]
+ * @returns {Promise<Array<object>>} Track[]
+ */
+/**
+ * Лайкнутое из SoundCloud: /users/{id}/likes.
+ *
+ * Требует постоянного client_id (public client_id из браузера чужие лайки не
+ * отдаёт — 401), поэтому берём его из настроек или переменной окружения.
+ * Без client_id возвращаем понятную причину, а не пустой список.
+ *
+ * @param {number} limit
+ * @param {string} [profileUrl]
+ * @returns {Promise<{items: object[], reason?: string}>}
+ */
+/** Кто вошёл: /me по OAuth-токену (null, если сессии нет). */
+export async function sessionUser() {
+  if (!oauthToken()) return null;
+  try {
+    const me = await apiJson('/me', { limit: 1 });
+    return me && me.id ? { id: String(me.id), name: me.username || me.permalink || null } : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function likes(limit = 100, profileUrl = '') {
+  const size = clampInt(limit, 100, 1, 300);
+  const permanents = [configuredClientId, process.env.SOUNDCLOUD_CLIENT_ID]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  // со входом профиль и ключ не нужны: лайки берём по id вошедшего пользователя
+  if (oauthToken()) {
+    try {
+      const me = await apiJson('/me', { limit: 1 });
+      if (!me || !me.id) return { items: [], reason: 'SESSION_EXPIRED' };
+
+      // правильный путь для api-v2: /users/{id}/likes (а не /me/likes — он 404)
+      const data = await apiJson(`/users/${me.id}/likes`, { limit: size, linked_partitioning: 1 });
+      const collection = Array.isArray(data?.collection) ? data.collection : [];
+      const items = collection.map((entry) => entry?.track || entry).filter((raw) => raw && raw.id).map(mapTrack);
+      return { items, me: { id: String(me.id), name: me.username || null } };
+    } catch (err) {
+      console.warn(`[soundcloud] лайки не загрузились: ${(err && err.message) || err}`);
+      if (!/HTTP 40[13]/.test(String(err?.message))) return { items: [], reason: 'UPSTREAM' };
+      return { items: [], reason: 'SESSION_EXPIRED' };
+    }
+  }
+
+  if (!permanents.length && !oauthToken()) return { items: [], reason: 'NO_CLIENT_ID' };
+  const clientId = permanents[0];
+
+  const url = String(profileUrl || '').trim() || configuredProfileUrl();
+  if (!url) return { items: [], reason: 'NO_PROFILE' };
+  let userId = null;
+
+  try {
+    const resolved = parseApiResponse(await callApi('/resolve', { url }, clientId));
+    userId = resolved?.id ?? null;
+  } catch (err) {
+    return { items: [], reason: 'NO_PROFILE' };
+  }
+  if (!userId) return { items: [], reason: 'NO_PROFILE' };
+
+  try {
+    const data = parseApiResponse(await callApi(`/users/${userId}/likes`, { limit: size, linked_partitioning: 1 }, clientId));
+    const collection = Array.isArray(data?.collection) ? data.collection : [];
+    const items = collection
+      .map((entry) => entry?.track || entry)
+      .filter((raw) => raw && raw.id)
+      .map(mapTrack);
+    return { items };
+  } catch (err) {
+    const reason = err?.status === 401 || /HTTP 40[13]/.test(String(err?.message)) ? 'CLIENT_ID_REJECTED' : 'UPSTREAM';
+    return { items: [], reason };
+  }
+}
+
+/**
+ * Плейлисты (sets) пользователя SoundCloud.
+ * Требует постоянного client_id — как и лайки.
+ * @param {{owner?:string}} [options]
+ */
+export async function playlists(options = {}) {
+  const permanents = [configuredClientId, process.env.SOUNDCLOUD_CLIENT_ID]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  if (!permanents.length && !oauthToken()) return { items: [], reason: 'NO_CLIENT_ID' };
+
+  const clientId = permanents[0];
+  const url = String(options.owner || '').trim() || configuredProfileUrl() || 'https://soundcloud.com/you';
+
+  try {
+    const resolved = oauthToken() && !options.owner
+      ? await apiJson('/me')
+      : parseApiResponse(await callApi('/resolve', { url }, clientId));
+    const userId = resolved?.id;
+    if (!userId) return { items: [], reason: 'NO_PROFILE' };
+
+    const params = { limit: 50, linked_partitioning: 1 };
+    const data = oauthToken()
+      ? await apiJson(`/users/${userId}/playlists`, params)
+      : parseApiResponse(await callApi(`/users/${userId}/playlists`, params, clientId));
+    const collection = Array.isArray(data?.collection) ? data.collection : [];
+    const items = collection.map((raw) => ({
+      id: `soundcloud:${raw.id}`,
+      source: 'soundcloud',
+      owner: String(raw.user?.id || userId),
+      ownerName: raw.user?.username || null,
+      kind: String(raw.id),
+      title: String(raw.title || 'Без названия'),
+      trackCount: Number(raw.track_count) || 0,
+      cover: upgradeArtworkUrl(raw.artwork_url) || upgradeArtworkUrl(raw.user?.avatar_url),
+      description: String(raw.description || '').slice(0, 300),
+      visibility: raw.sharing === 'public' ? 'public' : 'private',
+      updated: raw.last_modified || null,
+    }));
+    return { items };
+  } catch (err) {
+    const reason = /HTTP 40[13]/.test(String(err?.message)) ? 'CLIENT_ID_REJECTED' : 'UPSTREAM';
+    return { items: [], reason };
+  }
+}
+
+/** Треки плейлиста SoundCloud: id вида soundcloud:<playlistId>. */
+export async function playlistTracks(playlistId, limit = 300) {
+  const permanents = [configuredClientId, process.env.SOUNDCLOUD_CLIENT_ID]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  if (!permanents.length && !oauthToken()) return { items: [], reason: 'NO_CLIENT_ID' };
+
+  const size = clampInt(limit, 300, 1, 500);
+  const id = String(playlistId || '').replace(/^soundcloud:/, '');
+  if (!/^\d+$/.test(id)) return { items: [], reason: 'BAD_ID' };
+
+  try {
+    const data = oauthToken()
+      ? await apiJson(`/playlists/${id}`)
+      : parseApiResponse(await callApi(`/playlists/${id}`, {}, permanents[0]));
+    const tracks = Array.isArray(data?.tracks) ? data.tracks : [];
+    return { items: tracks.filter((raw) => raw && raw.id).map(mapTrack).slice(0, size) };
+  } catch (err) {
+    return { items: [], reason: /HTTP 40[13]/.test(String(err?.message)) ? 'CLIENT_ID_REJECTED' : 'UPSTREAM' };
+  }
+}
+
+export async function resolvePlaylist(url){
+ const parsed=new URL(url);if(parsed.protocol!=='https:'||!['soundcloud.com','www.soundcloud.com'].includes(parsed.hostname)||!parsed.pathname.includes('/sets/'))throw Error('Нужна полная ссылка SoundCloud на плейлист /sets/.');
+ const data=await apiJson('/resolve',{url:parsed.href});if(data.kind!=='playlist'||!data.id)throw Error('SoundCloud не нашёл плейлист.');
+ return {title:data.title||'Из SoundCloud',...(await playlistTracks('soundcloud:'+data.id))};
+}
+
+export async function search(query, limit) {
+  const text = String(query ?? '').trim();
+  if (!text) throw fail('BAD_REQUEST', 'Пустой поисковый запрос');
+  const size = clampInt(limit, 20, 1, 50);
+  // повтор: через обход блокировки первые соединения к api-v2 обрываются
+  const data = await withRetry(() => apiJson('/search/tracks', {
+    q: text,
+    limit: size,
+    linked_partitioning: 1,
+    app_locale: 'en',
+  }), 3);
+  const collection = Array.isArray(data?.collection) ? data.collection : [];
+  return collection.map(mapTrack);
+}
+
+/**
+ * @param {string|number} sourceId
+ * @returns {Promise<object>} Track
+ */
+export async function track(sourceId) {
+  return mapTrack(await fetchTrackRaw(sourceId));
+}
+
+/**
+ * Треки исполнителя в SoundCloud.
+ *
+ * API звукооблака отдаёт пользователя по его id, а его треки — отдельным
+ * запросом. По одному имени трек не найти, поэтому id приходит вместе
+ * с треком (поле user.id).
+ *
+ * @param {string|number} artistId
+ * @param {number} limit
+ */
+export async function artistTracks(artistId, limit = 50) {
+  const id = String(artistId || '').trim();
+  if (!id) throw fail('BAD_REQUEST', 'Не указан исполнитель');
+
+  const size = Math.min(Math.max(Number(limit) || 50, 1), 200);
+
+  // Повтор при сетевом обрыве и при протухшем client_id: публичный ключ,
+  // добытый со страницы, иногда мёртв с первого раза, а api-v2 к тому же
+  // рвёт соединение при параллельных запросах.
+  const data = await withRetry(async (attempt) => {
+    if (attempt > 1) await getClientId(true).catch(() => {});
+    return apiJson(`/users/${encodeURIComponent(id)}/tracks`, {
+      limit: size,
+      linked_partitioning: 1,
+    });
+  });
+
+  const list = Array.isArray(data?.collection) ? data.collection : [];
+  return { artistId: id, tracks: list.map(mapTrack).filter(Boolean) };
+}
+
+/** Имя и аватар исполнителя для заголовка страницы. */
+export async function artistInfo(artistId) {
+  const id = String(artistId || '').trim();
+  if (!id) return null;
+  try {
+    const user = await withRetry(() => apiJson(`/users/${encodeURIComponent(id)}`));
+    if (!user) return null;
+    return {
+      artistId: id,
+      name: user.username || user.permalink || '',
+      cover: user.avatar_url || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function transcodingRank(transcoding) {
+  const protocol = String(transcoding?.format?.protocol || '').toLowerCase();
+  const preset = String(transcoding?.preset || '').toLowerCase();
+  if (protocol === 'progressive') return preset.startsWith('mp3_0') ? 0 : 1;
+  if (protocol === 'hls') {
+    if (preset.startsWith('aac_160')) return 2;
+    if (preset.startsWith('aac_96')) return 3;
+    if (preset.startsWith('mp3_')) return 4;
+    if (preset === 'abr_sq') return 6;
+    return 5;
+  }
+  return 9;
+}
+
+async function callTranscoding(transcodingUrl, clientId) {
+  let url;
+  try {
+    url = new URL(transcodingUrl);
+  } catch {
+    throw fail('UPSTREAM', 'SoundCloud вернул некорректный URL транскодинга');
+  }
+
+  // Пустой client_id в URL — гарантированный 401. Если его нет, идём
+  // с авторизацией аккаунта: так поток отдаётся при живом входе.
+  if (clientId) url.searchParams.set('client_id', clientId);
+
+  const headers = { accept: 'application/json' };
+  const token = oauthToken();
+  if (token) headers.authorization = `OAuth ${token}`;
+
+  const response = await httpText(url.toString(), { timeout: TIMEOUT_MS, headers });
+
+  /*
+   * Читаем счётчик лимита.
+   *
+   * SoundCloud присылает X-Ratelimit-Remaining — сколько запросов потока
+   * осталось на сутки (по умолчанию 1500). Раньше мы эти заголовки не
+   * смотрели и узнавали о конце лимита только по отказу 429. Теперь
+   * остаток известен заранее и виден в интерфейсе.
+   */
+  readRateLimit(response.headers);
+
+  // 429 — слишком часто. Запоминаем и притормаживаем последующие запросы.
+  if (response.status === 429) {
+    const retryAfter = Number(response.headers?.get?.('retry-after') || 0);
+    rateLimitedUntil = Date.now() + Math.max(5000, retryAfter * 1000);
+    console.warn('[soundcloud] ограничение частоты (429)');
+  }
+
+  return response;
+}
+
+/**
+ * Разобрать заголовки лимита и запомнить состояние.
+ *
+ * SoundCloud отдаёт:
+ *   X-Ratelimit-Limit     — потолок окна (1500 для потока за сутки)
+ *   X-Ratelimit-Remaining — сколько осталось
+ *   X-Ratelimit-Reset     — когда окно сбрасывается (unix-время)
+ */
+function readRateLimit(headers) {
+  if (!headers?.get) return;
+  try {
+    const limit = Number(headers.get('x-ratelimit-limit') || 0);
+    const remaining = Number(headers.get('x-ratelimit-remaining') || 0);
+    const reset = Number(headers.get('x-ratelimit-reset') || 0);
+    if (!limit && !remaining) return;
+    rateLimit = {
+      limit,
+      remaining,
+      resetAt: reset ? reset * 1000 : 0,
+      at: Date.now(),
+    };
+  } catch { /* заголовков может не быть */ }
+}
+
+/**
+ * Учёт лимита прослушиваний.
+ *
+ * По документации SoundCloud разрешает 1500 запросов потока в сутки, но
+ * заголовки X-Ratelimit-* отдаёт только приложениям с официальным ключом.
+ * У нас ключ скрейпленный — заголовков нет, поэтому считаем сами: сколько
+ * раз за сутки запросили поток, столько и израсходовали. Это не точный
+ * остаток со стороны сервиса, но честное приближение: человек видит,
+ * сколько прослушиваний осталось, а не узнаёт о лимите по ошибке.
+ */
+const LISTEN_QUOTA = 1500;
+let listenCount = 0;
+let listenWindowStart = Date.now();
+
+function countListen() {
+  // окно — сутки
+  if (Date.now() - listenWindowStart > 24 * 60 * 60 * 1000) {
+    listenCount = 0;
+    listenWindowStart = Date.now();
+  }
+  listenCount += 1;
+}
+
+/** Состояние лимита для интерфейса. */
+export function rateLimitState() {
+  // если сервер прислал точные заголовки — показываем их
+  if (rateLimit) {
+    const percent = rateLimit.limit ? Math.round((rateLimit.remaining / rateLimit.limit) * 100) : null;
+    return {
+      ...rateLimit,
+      percent,
+      low: percent !== null && percent < 15,
+      empty: rateLimit.remaining <= 0,
+      source: 'server',
+    };
+  }
+
+  // иначе — наш счётчик по документированной квоте SoundCloud
+  const remaining = Math.max(0, LISTEN_QUOTA - listenCount);
+  const percent = Math.round((remaining / LISTEN_QUOTA) * 100);
+  return {
+    limit: LISTEN_QUOTA,
+    remaining,
+    used: listenCount,
+    resetAt: listenWindowStart + 24 * 60 * 60 * 1000,
+    at: Date.now(),
+    percent,
+    low: percent < 15,
+    empty: remaining <= 0,
+    source: 'local',
+  };
+}
+
+/** transcoding.url → {url, contentType} уже подписанного медиа-URL (живёт ограниченное время). */
+async function resolveTranscoding(transcoding, { retry = true } = {}) {
+  if (!transcoding?.url) throw fail('UPSTREAM', 'У транскодинга SoundCloud нет URL');
+
+  /*
+   * Кэш подписанного адреса.
+   *
+   * Каждый вызов здесь — ОДИН запрос из суточного лимита (1500). Подписанный
+   * адрес живёт не меньше часа, поэтому повтор трека, перемотка и возврат
+   * назад не должны тратить лимит заново. Без кэша человек сгорал лимит за
+   * пару часов прослушивания и получал «не удалось получить поток».
+   */
+  const cacheKeyUrl = transcoding.url;
+  const cachedUrl = resolvedUrlCache.get(cacheKeyUrl);
+  if (cachedUrl && Date.now() - cachedUrl.at < RESOLVED_URL_TTL_MS) {
+    return cachedUrl.value;
+  }
+
+  /*
+   * Поток требует client_id — вход через аккаунт (oauth_token) его НЕ заменяет.
+   * Если client_id добыть не удалось, пробуем запросить поток с токеном:
+   * api-v2 иногда принимает `Authorization: OAuth` и для транскодингов.
+   */
+  let clientId = '';
+  try {
+    clientId = await getClientId();
+  } catch (error) {
+    if (!oauthToken()) throw error;
+    // client_id нет, но аккаунт есть — попробуем авторизацией
+    const authorized = await callTranscoding(transcoding.url, '');
+    if (authorized.status !== 401) {
+      if (authorized.status === 404) throw fail('NOT_PLAYABLE', 'SoundCloud не отдал этот поток (HTTP 404)');
+      if (!authorized.ok) throw fail('UPSTREAM', `SoundCloud не отдал поток (HTTP ${authorized.status})`);
+      try {
+        const data = JSON.parse(authorized.body);
+        return { url: data?.url, contentType: data?.content_type || transcoding.format?.mime_type || null };
+      } catch {
+        throw fail('UPSTREAM', 'SoundCloud вернул некорректный JSON при запросе потока');
+      }
+    }
+    throw error;
+  }
+
+  // каждый реальный запрос потока — минус одно прослушивание из суточной квоты
+  countListen();
+
+  let response = await callTranscoding(transcoding.url, clientId);
+
+  /*
+   * 429 — сервер считает запрос «сторонним». Лечится не паузой, а тем,
+   * чтобы передать client_id в адресе: с ним транскодинг отдаётся сразу
+   * (проверено: без ключа 429, с ключом 200 и звук пошёл).
+   */
+  if (response.status === 429 && !clientId) {
+    const fallback = await getClientId().catch(() => '');
+    if (fallback) {
+      clientId = fallback;
+      response = await callTranscoding(transcoding.url, clientId);
+    }
+  }
+
+  if (response.status === 401 && retry) {
+    invalidateClientId();
+    clientId = await getClientId(true).catch(() => '');
+    if (clientId) response = await callTranscoding(transcoding.url, clientId);
+    // последняя попытка — через сохранённый вход
+    if (response.status === 401 && oauthToken()) {
+      response = await callTranscoding(transcoding.url, '');
+    }
+  }
+
+  if (response.status === 404) throw fail('NOT_PLAYABLE', 'SoundCloud не отдал этот поток (HTTP 404)');
+  if (response.status === 401) throw fail('AUTH_FAILED', 'SoundCloud отклонил client_id при запросе потока');
+  if (response.status === 429) throw fail('UPSTREAM', 'SoundCloud ограничил частоту запросов — попробуйте через минуту');
+  if (!response.ok) throw fail('UPSTREAM', `SoundCloud не отдал поток (HTTP ${response.status})`);
+
+  let data;
+  try {
+    data = JSON.parse(response.body);
+  } catch {
+    throw fail('UPSTREAM', 'SoundCloud вернул некорректный JSON при запросе потока');
+  }
+  if (!data?.url) throw fail('UPSTREAM', 'SoundCloud не вернул URL потока');
+
+  const resolved = { url: String(data.url), contentType: transcoding?.format?.mime_type || null };
+
+  // запоминаем подписанный адрес: повтор и перемотка не тратят лимит
+  if (resolvedUrlCache.size >= RESOLVED_URL_MAX) {
+    resolvedUrlCache.delete(resolvedUrlCache.keys().next().value);
+  }
+  resolvedUrlCache.set(cacheKeyUrl, { value: resolved, at: Date.now() });
+
+  return resolved;
+}
+
+/** HLS → один буфер: init.mp4 + все сегменты по порядку (fMP4 остаётся валидным). */
+async function hlsToBuffer(playlistUrl, transcoding) {
+  const playlist = await httpText(playlistUrl, { headers: { accept: '*/*' }, maxBytes: 1024 * 1024 });
+  if (!playlist.ok) throw fail('UPSTREAM', 'HLS playlist HTTP ' + playlist.status);
+  const text = playlist.body;
+  if (!text.trimStart().startsWith('#EXTM3U')) throw fail('UPSTREAM', 'Invalid HLS playlist');
+  // Concatenation only supports complete, unencrypted media playlists. Silently
+  // concatenating masters, byte ranges, changing init maps or keys corrupts audio.
+  if (/#EXT-X-(?:STREAM-INF|KEY|BYTERANGE|DISCONTINUITY)/.test(text) || !text.includes('#EXT-X-ENDLIST')) {
+    throw fail('NOT_SUPPORTED', 'SoundCloud: неподдерживаемый формат HLS');
+  }
+  const maps = [...text.matchAll(/#EXT-X-MAP:([^\r\n]+)/g)];
+  if (maps.length > 1 || maps.some(m => /BYTERANGE/.test(m[1]))) throw fail('NOT_SUPPORTED', 'HLS init map');
+  const initMatch = maps[0]?.[1].match(/URI="([^"]+)"/);
+  if (maps.length && !initMatch) throw fail('UPSTREAM', 'Invalid HLS init');
+  const urls = text.split(/\r?\n/).map(v => v.trim()).filter(v => v && !v.startsWith('#'));
+  if (!urls.length || urls.length > Math.min(MAX_HLS_SEGMENTS, MAX_MEDIA_REQUESTS - 20)) throw fail('NOT_SUPPORTED', 'SoundCloud: слишком много HLS-сегментов');
+  const mediaUrl = value => {
+    const url = new URL(value, playlistUrl);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw fail('UPSTREAM', 'Invalid HLS URL');
+    return url.toString();
+  };
+  const segments = urls.map(mediaUrl);
+  const initUrl = initMatch ? mediaUrl(initMatch[1]) : null;
+  const controller = new AbortController();
+  const parent = requestScope.getStore();
+  const signal = parent ? AbortSignal.any([parent.signal, controller.signal]) : controller.signal;
+  return requestScope.run({ ...parent, signal, budget: parent?.budget || { requests: 0 } }, async () => {
+    const chunks = new Array(segments.length);
+    let total = 0, cursor = 0, failure;
+    let init;
+    if (initUrl) {
+      init = await httpBuffer(initUrl, { maxBytes: MAX_HLS_BYTES });
+      if (!init.ok) throw fail('UPSTREAM', 'HLS init HTTP ' + init.status);
+      total += init.buffer.length;
+    }
+    const worker = async () => {
+      while (!signal.aborted) {
+        const index = cursor++;
+        if (index >= segments.length) return;
+        try {
+          const chunk = await httpBuffer(segments[index], { maxBytes: Math.min(16 * 1024 * 1024, MAX_HLS_BYTES - total) });
+          if (!chunk.ok || !chunk.buffer.length) throw fail('UPSTREAM', 'HLS segment HTTP ' + chunk.status);
+          total += chunk.buffer.length;
+          if (total > MAX_HLS_BYTES) throw fail('NOT_SUPPORTED', 'SoundCloud: превышен лимит аудиобуфера');
+          chunks[index] = chunk.buffer;
+        } catch (error) { failure ||= error; controller.abort(error); return; }
+      }
+    };
+    // Settle every worker before returning: no abandoned downloads on failure.
+    await Promise.allSettled(Array.from({ length: Math.min(HLS_CONCURRENCY, segments.length) }, worker));
+    if (failure) throw failure;
+    signal.throwIfAborted();
+    const mime = String(transcoding?.format?.mime_type || '').toLowerCase();
+    if (!initUrl && !mime.includes('mpeg')) throw fail('NOT_SUPPORTED', 'SoundCloud: HLS container requires an init segment');
+    return { buffer: Buffer.concat(init ? [init.buffer, ...chunks] : chunks),
+      contentType: initUrl ? 'audio/mp4' : 'audio/mpeg', segments: segments.length, hasInit: Boolean(initUrl) };
+  });
+}
+
+/** Complete playable media. Caller may cancel with stream(id, {signal}). */
+export async function stream(sourceId, { signal: callerSignal, timeoutMs = TRACK_TIMEOUT_MS } = {}) {
+  const controller = new AbortController();
+  const duration = clampInt(timeoutMs, TRACK_TIMEOUT_MS, 1, TRACK_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(new DOMException('SoundCloud track deadline exceeded', 'TimeoutError')), duration);
+  const signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
+  try {
+    return await requestScope.run({ signal, budget: { requests: 0 } }, () => streamMedia(sourceId));
+  } finally { clearTimeout(timer); controller.abort(); }
+}
+async function streamMedia(sourceId) {
+  checkCancelled();
+  const raw = await fetchTrackRaw(sourceId);
+  const availability = availabilityOf(raw);
+  if (!availability.playable) throw fail('NOT_PLAYABLE', 'SoundCloud: трек недоступен (' + availability.reason + ')');
+  const transcodings = (raw?.media?.transcodings || [])
+    .filter(t => !t.snipped && SUPPORTED_PROTOCOLS.has(String(t?.format?.protocol || '').toLowerCase()))
+    .sort((a, b) => transcodingRank(a) - transcodingRank(b));
+  let lastError;
+  for (const transcoding of transcodings.slice(0, 2)) {
+    checkCancelled();
+    try {
+      if (rateLimitedUntil > Date.now()) await pause(Math.min(rateLimitedUntil - Date.now(), 4000));
+      const resolved = await resolveTranscoding(transcoding);
+      if (String(transcoding.format.protocol).toLowerCase() === 'progressive') {
+        const media = await httpBuffer(resolved.url);
+        if (!media.ok || !media.buffer.length) throw fail('UPSTREAM', 'SoundCloud media HTTP ' + media.status);
+        const declared = String(media.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        const fallback = String(resolved.contentType || '').split(';')[0].trim().toLowerCase();
+        if (declared && !/^audio\/[\w.+-]+$/.test(declared) && declared !== 'application/octet-stream') throw fail('UPSTREAM', 'SoundCloud: ответ не является аудио');
+        const contentType = /^audio\/[\w.+-]+$/.test(declared) ? declared : fallback;
+        if (!/^audio\/[\w.+-]+$/.test(contentType)) throw fail('UPSTREAM', 'SoundCloud: неизвестный MIME аудио');
+        return { buffer: media.buffer, contentType, repeatable: false };
+      }
+      const media = await hlsToBuffer(resolved.url, transcoding);
+      return { buffer: media.buffer, contentType: media.contentType, repeatable: false };
+    } catch (error) { checkCancelled(); lastError = error; }
+  }
+  throw lastError || fail('NOT_PLAYABLE', 'SoundCloud не отдал аудиопоток');
+}
+
+export async function wave() {
+  throw fail('NOT_SUPPORTED', 'SoundCloud не поддерживает «Волну» — используйте поиск');
+}
+
+export async function feedback() {
+  throw fail('NOT_SUPPORTED', 'SoundCloud не поддерживает feedback');
+}
+
+/* ------------------------------------------------------------------ */
+/* отладочные хуки для _probe-sc.mjs (не часть контракта)              */
+/* ------------------------------------------------------------------ */
+
+export const _debug = {
+  // Isolated transport probes use media rules too: never auto-recover/probe proxies.
+  httpBuffer: (...args) => requestScope.run({ signal: new AbortController().signal, budget: { requests: 0 } }, () => httpBuffer(...args)),
+  httpText: (...args) => requestScope.run({ signal: new AbortController().signal, budget: { requests: 0 } }, () => httpText(...args)),
+  async clientId() {
+    const value = await getClientId();
+    return { masked: maskClientId(value), source: clientIdSource, acquire: lastAcquire };
+  },
+  lastAcquisition() {
+    return lastAcquire;
+  },
+  async inspect(sourceId) {
+    const raw = await fetchTrackRaw(sourceId);
+    const availability = availabilityOf(raw);
+    return {
+      id: raw.id,
+      title: raw.title,
+      policy: raw.policy,
+      monetization_model: raw.monetization_model,
+      streamable: raw.streamable,
+      access: raw.access,
+      durationSec: Math.round(Number(raw.full_duration || raw.duration || 0) / 1000),
+      playable: availability.playable,
+      reason: availability.reason,
+      artwork: raw.artwork_url,
+      transcodings: (Array.isArray(raw?.media?.transcodings) ? raw.media.transcodings : []).map((transcoding) => ({
+        preset: transcoding.preset,
+        protocol: transcoding.format?.protocol,
+        mime: transcoding.format?.mime_type,
+        snipped: Boolean(transcoding.snipped),
+        url: transcoding.url,
+      })),
+    };
+  },
+  async resolve(sourceId, protocol = 'hls') {
+    const raw = await fetchTrackRaw(sourceId);
+    const wanted = String(protocol).toLowerCase();
+    const candidates = (Array.isArray(raw?.media?.transcodings) ? raw.media.transcodings : [])
+      .filter((transcoding) => String(transcoding?.format?.protocol || '').toLowerCase() === wanted)
+      .sort((a, b) => transcodingRank(a) - transcodingRank(b));
+    if (!candidates.length) throw fail('NOT_FOUND', `У трека нет транскодинга ${wanted}`);
+    const resolved = await resolveTranscoding(candidates[0]);
+    return {
+      protocol: wanted,
+      preset: candidates[0].preset,
+      mime: candidates[0].format?.mime_type,
+      url: resolved.url,
+    };
+  },
+};
