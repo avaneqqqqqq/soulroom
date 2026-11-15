@@ -1,6 +1,6 @@
 {
   "name": "soulroom",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "description": "Музыка из твоих сервисов в одном пространстве",
@@ -10,7 +10,7 @@
     "test": "node --check dist/app.js && node server/selftest.mjs",
     "dist:win": "electron-builder --win nsis --x64 --publish never",
     "release:win": "node tools/publish-release.cjs",
-    "test:release": "node --test server/player-regressiontest.mjs server/eqtest.mjs server/experiencetest.mjs server/spotify-usertest.mjs server/auth-capturetest.mjs server/auth-sessiontest.mjs server/update-uitest.mjs server/settings-persisttest.mjs server/soundcloudmediatest.mjs server/discovery-cliptest.mjs server/peer-bridgetest.mjs server/ui-integrationtest.cjs"
+    "test:release": "node --test server/player-regressiontest.mjs server/eqtest.mjs server/experiencetest.mjs server/spotify-usertest.mjs server/auth-capturetest.mjs server/auth-sessiontest.mjs server/update-uitest.mjs server/settings-persisttest.mjs server/soundcloudmediatest.mjs server/discovery-cliptest.mjs server/peer-bridgetest.mjs server/ui-integrationtest.cjs server/desktop-porttest.cjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.11",

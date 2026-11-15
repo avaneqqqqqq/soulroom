@@ -5,9 +5,9 @@ const domains={yandex:['yandex.ru','yandex.net','ya.ru'],soundcloud:['soundcloud
 function trustedHost(value,source){try{const u=new URL(value);return u.protocol==='https:'&&domains[source]?.some(h=>u.hostname===h||u.hostname.endsWith('.'+h))}catch{return false}}
 function authHeader(headers){const entry=Object.entries(headers||{}).find(([k])=>k.toLowerCase()==='authorization');const value=Array.isArray(entry?.[1])?entry[1][0]:entry?.[1];const m=/^(?:OAuth|Bearer)\s+([A-Za-z0-9_.~-]{8,})$/i.exec(String(value||''));return m?.[1]||null}
 function soundcloudCookies(cookies){return (cookies||[]).filter(c=>/(^|\.)soundcloud\.com$/i.test(String(c.domain||'').replace(/^\./,''))&&['oauth_token','oauth_refresh_token'].includes(c.name)&&typeof c.value==='string'&&c.value.length>8).map(({name,value,domain})=>({name,value,domain}))}
-module.exports=function(mainWindow,port){
+module.exports=function(mainWindow,port,uiPort=port){
  const contexts=new Map();
- const trustedMain=e=>e.sender===mainWindow.webContents&&e.senderFrame?.routingId===mainWindow.webContents.mainFrame.routingId&&e.senderFrame?.processId===mainWindow.webContents.mainFrame.processId&&e.senderFrame.url.startsWith(`http://127.0.0.1:${port}/`);
+ const trustedMain=e=>e.sender===mainWindow.webContents&&e.senderFrame?.routingId===mainWindow.webContents.mainFrame.routingId&&e.senderFrame?.processId===mainWindow.webContents.mainFrame.processId&&e.senderFrame.url.startsWith(`http://127.0.0.1:${uiPort}/`);
  const notify=(source,state)=>{if(!mainWindow.isDestroyed())mainWindow.webContents.send('auth:progress',{source,...state})};
  async function open(source){const old=contexts.get(source);if(old&&!old.win.isDestroyed()){old.win.show();old.win.focus();return {ok:false,error:'already_open',message:'Окно входа уже открыто. Перезагрузи страницу или нажми «Я вошёл — проверить».'}}
   const sourceSession=session.fromPartition('persist:soulroom-'+source);

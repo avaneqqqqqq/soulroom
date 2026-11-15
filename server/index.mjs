@@ -39,7 +39,7 @@ import * as dpiwatcher from './dpiwatcher.mjs';
 import * as debuglog from './debuglog.mjs';
 import * as autofix from './autofix.mjs';
 
-const PORT = Number(
+let PORT = Number(
   process.env.PORT ||
     (process.argv.find((a) => a.startsWith('--port=')) || '').split('=')[1] ||
     5288,
@@ -1641,7 +1641,17 @@ loadProviders()
     });
   });
 
+// Desktop and its child exchange the actual listening port over their private IPC pipe.
+server.prependOnceListener('listening', () => {
+  PORT = server.address().port;
+  process.send?.({type: 'listening', port: PORT});
+});
 server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE' && process.send && PORT !== 0) {
+    PORT = PORT === 5298 ? 0 : 5298;
+    server.listen(PORT, '127.0.0.1');
+    return;
+  }
   if (err.code === 'EADDRINUSE') {
     store.log(`Порт ${PORT} занят — скорее всего плеер уже запущен.`);
     process.exit(0);
