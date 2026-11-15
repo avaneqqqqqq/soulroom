@@ -83,12 +83,12 @@ async function request(pathname, { method = 'GET', body, headers = {} } = {}) {
           ...headers,
         },
         body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(TIMEOUT),
+        signal: AbortSignal.timeout(4000),
       });
 
       // сервер ответил осмысленно — дальше перебирать хосты не нужно
       if (response.status === 401 || response.status === 403) return response;
-      if (response.status >= 500) throw fail(`HTTP ${response.status}`, 'сервер ответил ошибкой');
+      if (response.status === 404 || response.headers.get('content-type')?.includes('text/html') || response.status >= 500) throw fail(`HTTP ${response.status}`, 'сервер ответил ошибкой');
       return response;
     });
   } catch (err) {
@@ -284,23 +284,8 @@ function signFileInfo(ts, trackId, quality, codecs, transports) {
 async function getFileInfo(trackId, { quality, codecs, transports }) {
   const ts = Math.floor(Date.now() / 1000);
   const sign = signFileInfo(ts, trackId, quality, codecs, transports);
-  const url =
-    `${API}/get-file-info?ts=${ts}&trackId=${encodeURIComponent(trackId)}` +
-    `&quality=${quality}&codecs=${codecs}&transports=${transports}&sign=${encodeURIComponent(sign)}`;
-
-  let data;
-  try {
-    const res = await fetch(url, {
-      headers: { ...authHeaders(), Referer: 'https://music.yandex.ru/' },
-      signal: AbortSignal.timeout(TIMEOUT),
-    });
-    const text = await res.text();
-    if (!res.ok) throw fail('UPSTREAM', `get-file-info ${res.status}`);
-    data = JSON.parse(text);
-  } catch (err) {
-    throw err.code ? err : fail('UPSTREAM', `get-file-info: ${err.message}`);
-  }
-
+  const params = new URLSearchParams({ts:String(ts), trackId:String(trackId), quality, codecs, transports, sign});
+  const data = await request('/get-file-info?' + params, {headers:{Referer:'https://music.yandex.ru/'}});
   const info = data?.downloadInfo || data?.result?.downloadInfo || data?.result;
   if (!info) throw fail('NOT_PLAYABLE', 'Сервис не вернул информацию о файле');
 
@@ -308,7 +293,8 @@ async function getFileInfo(trackId, { quality, codecs, transports }) {
   if (!urls.length) throw fail('NOT_PLAYABLE', 'Нет доступных ссылок на файл');
 
   return {
-    url: decodeURIComponent(urls[0]),
+    url: /^https?:\/\//i.test(urls[0]) ? urls[0] : decodeURIComponent(urls[0]),
+    mirrors: urls.slice(1).map(url => /^https?:\/\//i.test(url) ? url : decodeURIComponent(url)),
     key: info.key || null,
     codec: info.codec || codecs,
     bitrate: info.bitrate || 0,
@@ -340,7 +326,7 @@ export async function stream(sourceId) {
       const lossless = String(info.codec).includes('flac');
       const isMp4 = String(info.codec).includes('mp4');
       const result = {
-        url: info.url,
+        url: info.url, mirrors: info.mirrors,
         contentType: lossless ? 'audio/flac' : isMp4 ? 'audio/mp4' : 'audio/mpeg',
         repeatable: false,
       };

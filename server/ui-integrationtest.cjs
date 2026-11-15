@@ -20,5 +20,20 @@ const tick=async()=>{for(let i=0;i<12;i++)await new Promise(r=>setImmediate(r))}
  click('[data-focus-tab="clips"]');await tick();assert.equal(ytOptions.playerVars.controls,0);assert.match(d.querySelector('#clipsStatus').textContent,/следует/);
  click('#focusPlayer [data-open-eq]');assert.equal(d.querySelector('.eq-dialog').open,true);click('[data-sound-mode="nightcore"]');assert.equal(d.querySelector('audio').playbackRate,1.25);assert.equal(d.querySelector('audio').preservesPitch,false);const band=d.querySelector('[data-eq-band="0"]');band.value='8';band.dispatchEvent(new w.Event('input',{bubbles:true}));assert.equal(d.querySelector('#eqEnabled').checked,true);click('#closeEq');click('#closeFocus');
  click('[data-page="favorites"]');await tick();click('[data-favorite-mode="playlists"]');click('#newPlaylist');d.querySelector('#playlistName').value='Тестовый плейлист';d.querySelector('#playlistNameForm').dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));click('#addPlayingPlaylist');await tick();assert.equal(d.querySelectorAll('#playlistTracks [data-track]').length,1);click('#openPlaylistImport');click('[data-list-remote-playlists="yandex"]');await tick();click('[data-copy-remote-playlist="0"]');await tick();assert.equal(d.querySelectorAll('#playlistTracks [data-track]').length,6);
+ click('[data-page="library"]');assert.equal(d.querySelectorAll('[data-track^="demo:"]').length,0);
+ click('[data-page="search"]');await tick();
+ const originalFetch=w.fetch;let finishSlow;
+ w.fetch=async(url,opt)=>{
+   const u=new URL(url,w.location.href);
+   if(u.pathname!=='/api/search')return originalFetch(url,opt);
+   const source=u.searchParams.get('sources');
+   if(source==='soundcloud')await new Promise(resolve=>{finishSlow=resolve});
+   return {ok:true,json:async()=>({groups:[{source,items:[{...items[0],id:source+':222',source}]}]})};
+ };
+ const searching=w.search('fixture','soundcloud,yandex');await tick();
+ assert.ok(d.querySelector('#results [data-track="yandex:222"]'));
+ await w.search('','yandex');finishSlow();await searching;
+ assert.equal(d.querySelectorAll('#results [data-track]').length,0);
+ w.fetch=originalFetch;
  assert.equal(errors.length,0,errors.join('\n'));console.log('PASS: complete UI initialization, real-cover routing, source defaults, mood chooser, wave, large player, lyric seeking, heart, automatic clip, EQ speed/bands, playlists and import. No real audio or browser used.');
 }finally{dom.window.close()}})().catch(e=>{console.error(e.stack);process.exitCode=1});

@@ -1,4 +1,4 @@
-let ownPlaylists=[];try{ownPlaylists=JSON.parse(localStorage.getItem('soulroom.playlists'))||[]}catch{}if(!Array.isArray(ownPlaylists))ownPlaylists=[];
+let ownPlaylists=[];try{ownPlaylists=JSON.parse(localStorage.getItem('soulroom.playlists'))||[]}catch{}if(!Array.isArray(ownPlaylists))ownPlaylists=[];for(const p of ownPlaylists)p.items=(p.items||[]).filter(t=>t?.source!=='demo');
 let favoriteMode='tracks',playlistSelected=null,playlistBusy=false,playlistNotice='',remotePlaylists=[];
 function persistPlaylists(){localStorage.setItem('soulroom.playlists',JSON.stringify(ownPlaylists));saveRemote()}
 function createPlaylist(title,items=[],source='soulroom'){const p={id:crypto.randomUUID(),title:String(title||'Новый плейлист').trim().slice(0,100),source,items:[...new Map(items.filter(t=>t?.id&&t?.title).map(t=>[t.id,t])).values()],createdAt:Date.now()};ownPlaylists.push(p);persistPlaylists();return p}

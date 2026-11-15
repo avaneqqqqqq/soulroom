@@ -1,6 +1,10 @@
 let waveStation=localStorage.getItem('soulroom.waveStation')||'user:onyourwave',waveCategories=[],waveStationsLoading=false;
 const waveFallbackStations=[{type:'genre',label:'Жанры',stations:[['rock','Рок'],['pop','Поп'],['electronic','Электроника'],['jazz','Джаз'],['classical','Классика'],['rap','Хип-хоп'],['indie','Инди']].map(([tag,name])=>({id:'genre:'+tag,name}))},{type:'mood',label:'Настроение',stations:[['calm','Спокойное'],['energetic','Энергичное'],['sad','Меланхоличное']].map(([tag,name])=>({id:'mood:'+tag,name}))}];
-function waveTuning(){const categories=waveCategories.length?waveCategories:waveFallbackStations;return '<div class="wave-tuning"><label>Настроить волну<select id="waveStation" aria-label="Жанр или настроение"><option value="user:onyourwave">Для меня · Моя волна</option>'+categories.filter(c=>c.type!=='personal').map(c=>'<optgroup label="'+esc(c.label)+'">'+c.stations.map(st=>'<option value="'+esc(st.id)+'" '+(st.id===waveStation?'selected':'')+'>'+esc(st.name)+'</option>').join('')+'</optgroup>').join('')+'</select></label><span class="wave-retry">'+(waveStationsLoading?'Загружаем станции…':'Выбор меняет подборку, но не запускает звук')+'</span></div>'}
+function waveTuning(){
+ const categories=waveCategories.length?waveCategories:waveFallbackStations;
+ const selected=categories.flatMap(c=>c.stations).find(s=>s.id===waveStation);
+ return '<button class="station-trigger" id="chooseStation"><span><small>Станция</small><strong>'+esc(selected?.name||(waveStation==='user:onyourwave'?'Для меня · Моя волна':waveStation))+'</strong></span>'+playerIcon('sliders')+'</button>';
+}
 async function loadWaveStations(){if(!backend||waveStationsLoading||waveCategories.length)return;waveStationsLoading=true;try{const d=await api('wave/stations');waveCategories=(d.categories||[]).filter(c=>Array.isArray(c.stations));}catch{}finally{waveStationsLoading=false;renderWave()}}
 function resetWaveStation(station){waveController?.abort();waveGeneration++;waveLoading=false;wavePending=null;waveStation=station;localStorage.setItem('soulroom.waveStation',station);waveItems=[];waveMessage='';waveActive=false;go('wave');loadWaveStations()}
 let waveItems=[],waveLoading=false,waveMessage='',waveEngine='',waveActive=false,waveQueue=null,waveGeneration=0,waveController=null,wavePending=null,waveWarmRetries=0;

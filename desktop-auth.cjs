@@ -21,6 +21,12 @@ module.exports=function(mainWindow,port,uiPort=port){
   c.home=source==='yandex'?oauth.buildAuthUrl(oauth.OAUTH_CLIENTS[0].id):'https://soundcloud.com/signin';
   contexts.set(source,c);
   const update=(text,extra={})=>{c.status=text;const data={source,text,...extra};if(!c.win.isDestroyed())c.win.webContents.send('auth-window:state',data);notify(source,{stage:c.saving?'saving':'waiting',message:text})};c.update=update;
+  let directRetry = false;
+  remote.on('did-fail-load', async (_event, code, _description, url, mainFrame) => {
+    if (source !== 'yandex' || !mainFrame || directRetry || ![-130,-111,-118,-101,-102,-105,-109].includes(code) || !trustedHost(url,source)) return;
+    directRetry = true;
+    try { await sourceSession.setProxy({mode:'direct'}); if (!remote.isDestroyed()) await remote.loadURL(url); } catch {}
+  });
   const cleanup=()=>{clearInterval(c.poller);sourceSession.cookies.removeListener('changed',c.onCookie);sourceSession.webRequest.onBeforeSendHeaders(null);try{if(!remote.isDestroyed())remote.close()}catch{}for(const p of c.popups)if(!p.isDestroyed())p.close();contexts.delete(source)};
 
   async function verify(){

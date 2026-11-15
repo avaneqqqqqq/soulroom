@@ -395,6 +395,19 @@ function openUpstream(urlStr, headers, redirects = 4) {
   });
 }
 
+async function openMedia(desc, headers) {
+  const urls = [desc.url, ...(desc.mirrors || [])];
+  for (const [index, url] of urls.entries()) {
+    try {
+      const response = await openUpstream(url, headers);
+      if (response.statusCode < 400 || index === urls.length - 1) return response;
+      response.destroy();
+    } catch (error) {
+      if (index === urls.length - 1) throw error;
+    }
+  }
+}
+
 function collectStream(stream, maxBytes = 120 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -431,7 +444,7 @@ async function getBuffered(source, sourceId, desc) {
   const hit = bufferCache.get(key);
   if (hit) return hit;
 
-  const upstream = await openUpstream(desc.url, desc.headers || {});
+  const upstream = await openMedia(desc, desc.headers || {});
   if ((upstream.statusCode || 500) >= 400) {
     upstream.resume();
     const err = new Error(`Апстрим ответил ${upstream.statusCode}`);
@@ -532,7 +545,7 @@ async function pipeUpstream(req, res, source, sourceId, attempt = 0) {
   if (req.headers.range) headers.Range = req.headers.range;
   headers['User-Agent'] = headers['User-Agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
 
-  const upstream = await openUpstream(desc.url, headers);
+  const upstream = await openMedia(desc, headers);
   const status = upstream.statusCode || 0;
 
   // подписанная ссылка могла протухнуть — берём свежую и пробуем ещё раз
@@ -548,7 +561,7 @@ async function pipeUpstream(req, res, source, sourceId, attempt = 0) {
   // выдаёт тишину — это и ломало звук у SoundCloud и Spotify
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
-  if (!res.getHeader('content-type')) res.setHeader('content-type', desc.contentType || 'audio/mpeg');
+  if (!res.getHeader('content-type') || /^application\/octet-stream/i.test(String(res.getHeader('content-type')))) res.setHeader('content-type', desc.contentType || 'audio/mpeg');
   if (!res.getHeader('accept-ranges')) res.setHeader('accept-ranges', 'bytes');
   res.setHeader('Cache-Control', 'private, max-age=600');
   res.writeHead(status || 200);
@@ -705,6 +718,25 @@ async function statusAll(force = false) {
 async function handleApi(req, res, url) {
   const segments = url.pathname.split('/').filter(Boolean); // ['api', ...]
   const route = segments.slice(1);
+  if (route[0] === 'player-favorites') {
+    const file = path.join(store.paths.DATA, 'player-favorites.json');
+    if (req.method === 'GET') {
+      let snapshot = null;
+      try {snapshot = JSON.parse(fs.readFileSync(file, 'utf8'))} catch (error) {if (error.code !== 'ENOENT') throw error}
+      sendJson(res, 200, {snapshot});
+      return;
+    }
+    if (req.method === 'PUT') {
+      const snapshot = await readJson(req);
+      if (!Array.isArray(snapshot.ids) || !snapshot.ids.every(id => typeof id === 'string') ||
+          !Array.isArray(snapshot.tracks) || !snapshot.tracks.every(t => t && typeof t.id === 'string')) throw badRequest('Некорректный список избранного');
+      fs.mkdirSync(store.paths.DATA,{recursive:true});
+      fs.writeFileSync(file+'.tmp',JSON.stringify({ids:snapshot.ids,tracks:snapshot.tracks}),{mode:0o600});
+      fs.renameSync(file+'.tmp',file);
+      sendJson(res,200,{ok:true});
+      return;
+    }
+  }
   if(route[0]==='artwork'&&req.method==='GET'){const art=await getArtwork(url.searchParams.get('url')||'');res.writeHead(200,{'Content-Type':art.type,'Content-Length':art.buffer.length,'Cache-Control':'private,max-age=14400','X-Content-Type-Options':'nosniff'});res.end(art.buffer);return;}
 
   if (route[0] === 'health') {
@@ -926,12 +958,13 @@ async function handleApi(req, res, url) {
     const quick = url.searchParams.get('quick') === '1';
     // live: кнопка «обновить» просит настоящую сборку, без подмены сохранённой лентой
     const live = url.searchParams.get('live') === '1';
-    if (quick && !live) {
+    if (quick || live) {
       const fresh = waveEngine.readyBatch(waveKey, limit);
       if (fresh) {
         // из памяти приходит свежая партия (пометки cached нет), с диска — сохранённая
         const freshItems = Array.isArray(fresh.items) ? fresh.items.slice(0, limit) : [];
         sendJson(res, 200, { ...fresh, items: freshItems });
+        if (limit >= 15) waveEngine.prepareWave(limit, station, sources).catch(()=>{});
         /*
          * Свежую партию сразу кладём на диск ПЕРВЫМИ.
          * Иначе следующее открытие снова прочитает старую ленту.
@@ -945,7 +978,7 @@ async function handleApi(req, res, url) {
       // мгновенно, а свежую собираем в фоне. Без этого первый вход
       // ждал до 20 секунд, пока ответят все сервисы.
       const onDisk = libraryCache.loadWave(waveKey);
-      if (onDisk && Array.isArray(onDisk.items) && onDisk.items.length) {
+      if (!live && onDisk && Array.isArray(onDisk.items) && onDisk.items.length) {
         sendJson(res, 200, {
           items: onDisk.items.slice(0, limit),
           station: onDisk.station || station,
@@ -999,7 +1032,7 @@ async function handleApi(req, res, url) {
     let built;
     try {
       built = await Promise.race([
-        waveEngine.prepareWave(limit, station, sources, live ? { budgetMs: 12000, thorough: true } : {}),
+        waveEngine.prepareWave(limit, station, sources, {budgetMs: 4200}),
         new Promise((resolve) => {
           waveTimer = setTimeout(() => resolve({ items: [], station, warming: true, hint: 'Собираем ленту — ещё пара секунд' }), live ? 14_000 : 8_000);
           waveTimer.unref?.();
@@ -1014,6 +1047,7 @@ async function handleApi(req, res, url) {
     // кэш ленты: сохраняем непустые партии и используем их, когда сервис недоступен
     if (Array.isArray(result.items) && result.items.length) {
       libraryCache.saveWave(waveKey, result.items, result.station || station);
+      if (limit >= 15) waveEngine.prepareWave(limit, station, sources).catch(()=>{});
     } else {
       const cached = libraryCache.loadWave(waveKey);
       if (cached) {

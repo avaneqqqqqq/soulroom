@@ -308,10 +308,13 @@ async function buildWave(limit = 20, station = DEFAULT_STATION, sources = null, 
     if (items.length) prepared.set(key, { ...old, station, sources: wanted, items });
   };
 
+  let finishWindow;
+  const mergeWindow = new Promise(resolve => {finishWindow = resolve});
+  let mergeTimer;
   const batches = await Promise.all(
     wanted.map((source) => {
       const work = (async () => {
-        if (source === 'yandex') return await yandexBatch(want, station);
+        if (source === 'yandex') return await yandexBatch(want, station, 1);
         if (source === 'soundcloud') return await soundcloudBatch(want, station);
         if (source === 'spotify') return await spotifyBatch(want, station);
         return null;
@@ -332,12 +335,18 @@ async function buildWave(limit = 20, station = DEFAULT_STATION, sources = null, 
       const completed = work.then((result) => {
         clearTimeout(timer);
         if (late) stashLate(result);
+        if (result?.items?.length && wanted.length > 1 && !mergeTimer) mergeTimer = setTimeout(finishWindow,400);
         return result;
       });
-      return Promise.race([completed, timeout]);
+      const cut = mergeWindow.then(() => {
+        late = true;
+        return {source, items:[], late:true};
+      });
+      return Promise.race([completed, timeout, cut]);
     }),
   );
 
+  clearTimeout(mergeTimer);
   const usable = batches.filter((b) => b && Array.isArray(b.items) && b.items.length);
   const hints = [];
   let skipped = 0;
@@ -375,7 +384,7 @@ async function buildWave(limit = 20, station = DEFAULT_STATION, sources = null, 
    */
   const thorough = options?.thorough === true;
   const extraRounds = thorough ? 0 : 2;
-  const wantedMost = thorough ? want : Math.ceil(want * 0.6);
+  const wantedMost = items.length ? Math.min(items.length, want) : Math.ceil(want * 0.6);
 
   for (let attempt = 0; attempt < 2 && items.length < wantedMost && !overBudget(); attempt += 1) {
     const extra = await Promise.all(
