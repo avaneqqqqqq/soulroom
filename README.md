@@ -4,7 +4,7 @@
 
 ## Установка
 
-Скачай **soulroom-0.2.0-setup.exe** в [Releases](https://github.com/avaneqqqqqq/soulroom/releases/latest). Установи и открой soulroom. Аккаунты подключаются в разделе «Источники и настройки».
+Скачай **soulroom-0.2.1-setup.exe** в [Releases](https://github.com/avaneqqqqqq/soulroom/releases/latest). Установи и открой soulroom. Аккаунты подключаются в разделе «Источники и настройки».
 
 ## Возможности
 
