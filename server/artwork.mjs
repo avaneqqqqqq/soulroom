@@ -1,0 +1,9 @@
+import * as relay from './providers/screlay.mjs';
+const cache=new Map(),MAX=4*1024*1024;
+export function artworkUrl(value){try{const u=new URL(value),h=u.hostname.toLowerCase();if(u.protocol!=='https:'||u.username||u.password||u.port&&u.port!=='443')return null;const allowed=['avatars.yandex.net','avatars.mds.yandex.net','avatars.mds.yandex.ru','i.scdn.co','mosaic.scdn.co'].includes(h)||h.endsWith('.sndcdn.com');if(!allowed||[...u.searchParams.keys()].some(k=>/token|oauth|cookie|authorization/i.test(k)))return null;return u}catch{return null}}
+export async function getArtwork(value){const u=artworkUrl(value);if(!u)throw Error('Недопустимый адрес обложки');const key=u.href,hit=cache.get(key);if(hit&&Date.now()-hit.at<14400000)return hit;
+ const load=async url=>{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),7000);let reader;try{const r=await fetch(url,{headers:{accept:'image/avif,image/webp,image/png,image/jpeg,image/gif','user-agent':'soulroom'},signal:controller.signal});if(!r.ok)throw Error('Artwork unavailable');const type=String(r.headers.get('content-type')||'').split(';')[0];if(!/^image\/(jpeg|png|webp|avif|gif)$/.test(type)||Number(r.headers.get('content-length')||0)>MAX)throw Error('Invalid artwork');reader=r.body.getReader();const chunks=[];let bytes=0;for(;;){const d=await reader.read();if(d.done)break;bytes+=d.value.length;if(bytes>MAX)throw Error('Artwork too large');chunks.push(Buffer.from(d.value))}return {buffer:Buffer.concat(chunks,bytes),type,at:Date.now()}}finally{clearTimeout(timer);try{await reader?.cancel()}catch{}}};
+ let result;if(u.hostname.endsWith('.sndcdn.com')&&relay.hasRelay()&&relay.list().working){try{result=await relay.through(key,load)}catch{}}
+ if(!result)try{result=await load(key)}catch(e){if(!relay.hasRelay())throw e;result=await relay.through(key,load)}
+ cache.set(key,result);while(cache.size>48)cache.delete(cache.keys().next().value);return result;
+}

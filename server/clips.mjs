@@ -36,11 +36,11 @@ function parseLength(text) {
  * @param {{title: string, artist: string}} meta
  * @returns {Promise<Array<{id: string, title: string, author: string, duration: number, thumb: string}>>}
  */
-export async function searchClips({ title, artist }) {
+export async function searchClips({ title, artist, duration=0 }) {
   const name = String(title || '').trim();
   if (!name) return [];
 
-  const key = `${artist || ''}|${name}`.toLowerCase();
+  const key = `${artist || ''}|${name}|${Math.round(duration)}`.toLowerCase();
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.items;
 
@@ -58,7 +58,7 @@ export async function searchClips({ title, artist }) {
     [artist, name].filter(Boolean).join(' '),
   ];
 
-  const pages = await Promise.all(queries.map((query) => fetchResults(query, { title, artist })));
+  const pages = await Promise.all([...queries.map((query) => fetchResults(query, { title, artist })),searchPeerTube({title,artist})]);
   const items = [];
   const seen = new Set();
   for (const page of pages) {
@@ -73,7 +73,7 @@ export async function searchClips({ title, artist }) {
   // соответствует треку. Первый результат поиска часто оказывается
   // кавером, slowed-версией или посторонним роликом — пользователю
   // не нужно выбирать вручную.
-  const ranked = rankVideos(items, { title, artist });
+  const ranked = rankVideos(items, { title, artist,duration });
 
   // Часть авторов запрещает встраивание — YouTube показывает внутри
   // «Видео недоступно». Проверяем три лучших кандидата через oembed
@@ -100,6 +100,7 @@ async function pickEmbeddable(candidates) {
   if (!candidates.length) return null;
 
   const checks = await Promise.all(candidates.map(async (video) => {
+    if(video.provider==='peertube')return {video,ok:true};
     try {
       const response = await fetch(
         `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${video.id}`)}&format=json`,
@@ -159,6 +160,7 @@ async function fetchResults(query, meta) {
     const thumbMatch = block.match(/"thumbnails":\[\{[^\]]*?"url":"(https:[^"]+)"/);
 
     items.push({
+      provider:'youtube',
       id,
       title: titleMatch ? decodeTitle(titleMatch[1]) : 'Видео',
       author: authorMatch ? decodeTitle(authorMatch[1]) : '',
@@ -204,25 +206,29 @@ const GOOD_WORDS = /клип|official|официальн|премьера|premie
  * Учитывается: совпадение названия, наличие исполнителя в названии или
  * канале, «официальность» ролика и минусы за каверы, slowed и реакции.
  */
-function rankVideos(items, { title, artist }) {
+export function rankVideos(items, { title, artist,duration=0 }) {
   const wantedTitle = squash(title);
   const wantedArtist = squash(artist);
 
   const scored = items.map((video, index) => {
     const haystack = `${video.title} ${video.author || ''}`;
-    const nameScore = overlap(wantedTitle, video.title);
-    const artistScore = wantedArtist ? overlap(wantedArtist, haystack) : 0;
+    const nameScore = wantedTitle&&squash(video.title).includes(wantedTitle)?1:overlap(wantedTitle, video.title);
+    const artistScore = wantedArtist ? (squash(haystack).includes(wantedArtist)?1:overlap(wantedArtist, haystack)) : 0;
 
     let score = nameScore * 3 + artistScore * 2;
     if (GOOD_WORDS.test(haystack)) score += 0.8;
-    if (BAD_WORDS.test(haystack)) score -= 1.6;
+    if (BAD_WORDS.test(haystack)&&!BAD_WORDS.test(wantedTitle)) score -= 1.6;
+    if(duration&&video.duration){const diff=Math.abs(video.duration-duration);score-=Math.min(2,diff/Math.max(30,duration*.2))}
     // порядок в поиске ещё что-то значит, но слабее текстового совпадения
     score -= index * 0.08;
 
-    return { video, score, nameScore };
+    return { video, score, nameScore,artistScore };
   });
 
   // без совпадения названия видео всё равно оставляем, но ниже
   scored.sort((a, b) => b.score - a.score);
-  return scored.map((entry) => entry.video);
+  return scored.filter(e=>e.nameScore>=.35&&(!wantedArtist||e.artistScore>=.2)).map((entry) => entry.video);
 }
+
+function publicPeerUrl(value){try{const u=new URL(value);const h=u.hostname.toLowerCase();return u.protocol==='https:'&&!u.username&&!u.password&&(!u.port||u.port==='443')&&!/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)&&!h.includes(':')&&!h.endsWith('.local')?u:null}catch{return null}}
+async function searchPeerTube({title,artist}){try{const r=await fetch('https://sepiasearch.org/api/v1/search/videos?'+new URLSearchParams({search:[artist,title].filter(Boolean).join(' '),count:'8',nsfw:'false'}),{signal:AbortSignal.timeout(5000)});if(!r.ok)return [];const d=await r.json();return (d.data||[]).flatMap(v=>{const u=publicPeerUrl(v.url),id=String(v.uuid||'');if(!u||!/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}$/.test(id))return [];return [{id,provider:'peertube',title:String(v.name||''),author:String(v.channel?.displayName||v.account?.displayName||''),duration:Number(v.duration)||0,url:u.href,embedUrl:u.origin+'/videos/embed/'+id,thumb:publicPeerUrl(v.thumbnailUrl||'')?.href||null}]})}catch{return []}}

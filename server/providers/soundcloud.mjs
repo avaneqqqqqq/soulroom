@@ -19,6 +19,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import {once} from 'node:events';
 import * as proxy from '../proxy.mjs';
 import * as sctoken from './sctoken.mjs';
 import * as screlay from './screlay.mjs';
@@ -221,6 +222,7 @@ async function httpFetch(url, { method = 'GET', headers = {}, body, timeout = TI
     try { return await perform(url); }
     catch (error) {
       checkCancelled();
+      if(error.noRetry)throw error;
       if (error.code === 'NOT_SUPPORTED') throw error;
       // OAuth credentials must never reach a third-party public relay.
       if (!sensitive && transportMode !== 'direct' && screlay.hasRelay()) return screlay.through(url, perform);
@@ -230,6 +232,7 @@ async function httpFetch(url, { method = 'GET', headers = {}, body, timeout = TI
   try { return await attempt(); }
   catch (error) {
     checkCancelled();
+    if(error.noRetry)throw error;
     if (error.code === 'NOT_SUPPORTED') throw error;
     // Media requests have a bounded transport budget; proxy recovery may run its
     // own background probes, so only non-media calls may trigger it.
@@ -1503,6 +1506,38 @@ async function hlsToBuffer(playlistUrl, transcoding) {
     return { buffer: Buffer.concat(init ? [init.buffer, ...chunks] : chunks),
       contentType: initUrl ? 'audio/mp4' : 'audio/mpeg', segments: segments.length, hasInit: Boolean(initUrl) };
   });
+}
+
+// MP3 can start after the first verified chunk. AAC/fMP4 keeps the buffered path.
+export async function streamFast(sourceId,req,res,{supportsAac=false}={}){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(new DOMException('Track deadline','TimeoutError')),TRACK_TIMEOUT_MS);
+ const abort=()=>{if(!res.writableEnded)controller.abort()};res.once('close',abort);
+ try{return await requestScope.run({signal:controller.signal,budget:{requests:0}},async()=>{
+  const raw=await fetchTrackRaw(sourceId);if(!availabilityOf(raw).playable)return {handled:false};
+  const candidates=(raw?.media?.transcodings||[]).filter(t=>!t.snipped&&(/audio\/mpeg/i.test(t.format?.mime_type||'')||supportsAac&&t.format?.protocol==='hls'&&/audio\/mp4/i.test(t.format?.mime_type||''))&&SUPPORTED_PROTOCOLS.has(t.format?.protocol)).sort((a,b)=>transcodingRank(a)-transcodingRank(b));
+  for(const transcoding of candidates.slice(0,2))try{
+   const resolved=await resolveTranscoding(transcoding);
+   if(transcoding.format.protocol==='progressive')return await httpFetch(resolved.url,{headers:req.headers.range?{range:req.headers.range}:{},consume:async(response,signal)=>{
+    if(!response.ok||![200,206].includes(response.status)||response.status===206&&!req.headers.range)throw fail('UPSTREAM','Invalid progressive response');
+    if(!/^audio\/mpeg(?:;|$)/i.test(response.headers.get('content-type')||resolved.contentType||''))throw fail('UPSTREAM','Expected MP3');
+    const declared=Number(response.headers.get('content-length')||0);if(declared>MAX_HLS_BYTES)throw fail('NOT_SUPPORTED','Audio limit');const reader=response.body.getReader(),chunks=[];let total=0;try{
+     let next=await reader.read();if(next.done||!next.value?.length)throw fail('UPSTREAM','Empty audio');
+     res.statusCode=response.status;for(const h of ['content-length','content-range','accept-ranges'])if(response.headers.has(h))res.setHeader(h,response.headers.get(h));res.setHeader('Content-Type','audio/mpeg');res.setHeader('Cache-Control','private,max-age=600');
+     while(!next.done){signal.throwIfAborted();total+=next.value.length;if(total>MAX_HLS_BYTES)throw fail('NOT_SUPPORTED','Audio limit');if(response.status===200)chunks.push(Buffer.from(next.value));if(!res.write(next.value))await once(res,'drain',{signal});next=await reader.read()}
+     if(declared&&declared!==total)throw fail('UPSTREAM','Incomplete audio');res.end();return {handled:true,buffer:response.status===200?Buffer.concat(chunks,total):null,contentType:'audio/mpeg'};
+    }catch(error){if(res.headersSent)error.noRetry=true;throw error}finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
+   }});
+   if(req.headers.range&&!/^bytes=0-?$/.test(req.headers.range))return {handled:false};
+   const playlist=await httpText(resolved.url,{maxBytes:1024*1024});if(!playlist.ok)throw fail('UPSTREAM','Playlist unavailable');const text=playlist.body;
+   if(!text.trimStart().startsWith('#EXTM3U')||!text.includes('#EXT-X-ENDLIST')||/#EXT-X-(?:STREAM-INF|KEY|BYTERANGE|DISCONTINUITY)/.test(text))return {handled:false};
+   const segments=text.split(/\r?\n/).map(s=>s.trim()).filter(s=>s&&!s.startsWith('#')).map(s=>{const u=new URL(s,resolved.url);if(!['https:','http:'].includes(u.protocol)||u.username||u.password)throw fail('UPSTREAM','Invalid segment');return u.href});
+   if(!segments.length||segments.length>Math.min(MAX_HLS_SEGMENTS,MAX_MEDIA_REQUESTS-20))return {handled:false};
+   const maps=[...text.matchAll(/#EXT-X-MAP:([^\r\n]+)/g)];if(maps.length>1||maps.some(m=>/BYTERANGE/.test(m[1])))return {handled:false};const initMatch=maps[0]?.[1].match(/URI="([^"]+)"/);if(maps.length&&!initMatch)return {handled:false};const contentType=initMatch?'audio/mp4':'audio/mpeg';if(contentType==='audio/mp4'&&!supportsAac)return {handled:false};let init=null;if(initMatch){const u=new URL(initMatch[1],resolved.url);if(!['https:','http:'].includes(u.protocol)||u.username||u.password)return {handled:false};init=await httpBuffer(u.href);if(!init.ok||!init.buffer.length)return {handled:false}}
+   const chunks=init?[init.buffer]:[],pending=new Map();let bytes=init?.buffer.length||0;const launch=i=>{if(i<segments.length&&!pending.has(i)){const p=httpBuffer(segments[i],{maxBytes:16*1024*1024});p.catch(()=>{});pending.set(i,p)}};
+   try{for(let i=0;i<Math.min(HLS_CONCURRENCY,segments.length);i++)launch(i);for(let i=0;i<segments.length;i++){checkCancelled();const c=await pending.get(i);pending.delete(i);if(!c.ok||!c.buffer.length)throw fail('UPSTREAM','Segment unavailable');bytes+=c.buffer.length;if(bytes>MAX_HLS_BYTES)throw fail('NOT_SUPPORTED','Audio limit');chunks.push(c.buffer);if(!res.headersSent){res.setHeader('Content-Type',contentType);res.setHeader('Cache-Control','private,max-age=600');res.setHeader('Accept-Ranges','none');if(init)res.write(init.buffer)}if(!res.write(c.buffer))await once(res,'drain',{signal:controller.signal});launch(i+HLS_CONCURRENCY)}res.end();return {handled:true,buffer:Buffer.concat(chunks,bytes),contentType}}finally{if(!res.writableEnded)controller.abort();await Promise.allSettled(pending.values())}
+  }catch(error){if(res.headersSent){res.destroy();return {handled:true}}checkCancelled()}
+  return {handled:false};
+ })}catch{if(res.headersSent){res.destroy();return {handled:true}}return {handled:false}}finally{clearTimeout(timer);res.removeListener('close',abort);controller.abort()}
 }
 
 /** Complete playable media. Caller may cancel with stream(id, {signal}). */

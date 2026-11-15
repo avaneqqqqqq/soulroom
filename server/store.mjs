@@ -65,12 +65,8 @@ const DEFAULT_SETTINGS = {
 };
 
 export function loadSettings() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(FILES.settings, 'utf8'));
-    return mergeSettings(DEFAULT_SETTINGS, raw);
-  } catch {
-    return structuredClone(DEFAULT_SETTINGS);
-  }
+  for(const file of [FILES.settings,FILES.settings+'.backup'])try{const raw=JSON.parse(fs.readFileSync(file,'utf8'));if(raw&&typeof raw==='object'&&!Array.isArray(raw))return mergeSettings(DEFAULT_SETTINGS,raw)}catch{}
+  return structuredClone(DEFAULT_SETTINGS);
 }
 
 function mergeSettings(base, patch) {
@@ -87,7 +83,10 @@ function mergeSettings(base, patch) {
 export function saveSettings(patch) {
   ensureDir();
   const merged = mergeSettings(loadSettings(), patch);
-  fs.writeFileSync(FILES.settings, JSON.stringify(merged, null, 2), 'utf8');
+  const text=JSON.stringify(merged,null,2),temporary=FILES.settings+'.tmp';
+  fs.writeFileSync(temporary,text,{encoding:'utf8',mode:0o600});
+  fs.renameSync(temporary,FILES.settings);
+  try{fs.copyFileSync(FILES.settings,FILES.settings+'.backup')}catch{}
   return merged;
 }
 
@@ -103,7 +102,7 @@ export function maskedSettings() {
       clientSecret: mask(s.spotify.clientSecret),
       hasCredentials: Boolean(s.spotify.clientId && s.spotify.clientSecret),
     },
-    wave: { sources: Array.isArray(s.wave?.sources) ? s.wave.sources : ['yandex', 'soundcloud'] },
+    wave: { sources: Array.isArray(s.wave?.sources) ? s.wave.sources : ['yandex', 'soundcloud'],defaultSource:s.wave?.defaultSource||null },
     network: {
       proxy: s.network?.proxy || '',
       hasProxy: Boolean(s.network?.proxy),

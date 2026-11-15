@@ -1,6 +1,6 @@
 {
   "name": "soulroom",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "Музыка из твоих сервисов в одном пространстве",
@@ -9,8 +9,8 @@
     "desktop": "electron desktop.cjs",
     "test": "node --check dist/app.js && node server/selftest.mjs",
     "dist:win": "electron-builder --win nsis --x64 --publish never",
-    "release:win": "electron-builder --win nsis --x64 --publish always",
-    "test:release": "node --test server/player-regressiontest.mjs server/eqtest.mjs server/experiencetest.mjs server/spotify-usertest.mjs server/auth-capturetest.mjs server/auth-sessiontest.mjs server/update-uitest.mjs"
+    "release:win": "node tools/publish-release.cjs",
+    "test:release": "node --test server/player-regressiontest.mjs server/eqtest.mjs server/experiencetest.mjs server/spotify-usertest.mjs server/auth-capturetest.mjs server/auth-sessiontest.mjs server/update-uitest.mjs server/settings-persisttest.mjs server/soundcloudmediatest.mjs server/discovery-cliptest.mjs server/peer-bridgetest.mjs server/ui-integrationtest.cjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.11",
@@ -18,7 +18,8 @@
   },
   "devDependencies": {
     "electron": "^45.3.2",
-    "electron-builder": "^26.18.0"
+    "electron-builder": "^26.18.0",
+    "jsdom": "^31.0.1"
   },
   "main": "desktop.cjs",
   "author": "avaneqqqqqq",

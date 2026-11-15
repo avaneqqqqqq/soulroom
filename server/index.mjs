@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as store from './store.mjs';
+import {getArtwork} from './artwork.mjs';
 import * as spotifyUser from './spotify-user.mjs';
 import { requestIsLocal } from './requestguard.mjs';
 import * as audiocache from './audiocache.mjs';
@@ -565,6 +566,9 @@ async function handleStream(req, res, source, sourceId) {
   const provider = providers[source];
   if (!provider) throw badRequest('Неизвестный источник');
 
+  const supportsAac=new URL(req.url||'/', 'http://127.0.0.1').searchParams.get('aac')==='1';
+  if(source==='soundcloud'&&req.method==='GET'&&provider.streamFast){const cached=audiocache.read(source,sourceId);if(cached&&(/audio\/mpeg/i.test(cached.contentType)||supportsAac&&/audio\/mp4/i.test(cached.contentType))){serveBuffer(cached.buffer,req,res,cached.contentType);return}if(!cached){const result=await provider.streamFast(sourceId,req,res,{supportsAac});if(result.handled){if(result.buffer?.length)audiocache.write(source,sourceId,result.buffer,result.contentType);return}}}
+
   const desc = await getDescriptor(source, sourceId);
   // своя музыка: отдаём файл с диска, с поддержкой Range
   if (desc.filePath) {
@@ -576,7 +580,7 @@ async function handleStream(req, res, source, sourceId) {
     // пере-упаковываем в MP3 один раз и кэшируем
     const isMp4 = /audio\/(mp4|m4a|x-m4a)/i.test(String(desc.contentType || ''))
       || looksLikeMp4(desc.buffer);
-    if (isMp4 && audioconvert.hasFfmpeg()) {
+    if (isMp4 && !supportsAac && audioconvert.hasFfmpeg()) {
       try {
         const mp3 = await audioconvert.getMp3(`${source}:${sourceId}`, async () => desc.buffer);
         if (mp3) {
@@ -701,9 +705,10 @@ async function statusAll(force = false) {
 async function handleApi(req, res, url) {
   const segments = url.pathname.split('/').filter(Boolean); // ['api', ...]
   const route = segments.slice(1);
+  if(route[0]==='artwork'&&req.method==='GET'){const art=await getArtwork(url.searchParams.get('url')||'');res.writeHead(200,{'Content-Type':art.type,'Content-Length':art.buffer.length,'Cache-Control':'private,max-age=14400','X-Content-Type-Options':'nosniff'});res.end(art.buffer);return;}
 
   if (route[0] === 'health') {
-    sendJson(res, 200, { ok: true, version: currentVersion(), uptime: Math.round(process.uptime()) });
+    sendJson(res, 200, { ok: true, version: currentVersion(), pid: process.pid, uptime: Math.round(process.uptime()) });
     return;
   }
 
@@ -881,6 +886,8 @@ async function handleApi(req, res, url) {
     await handleStream(req, res, route[1], decodeURIComponent(route[2]));
     return;
   }
+
+  if(route[0]==='stream'&&route[1]==='preload'&&req.method==='POST'){const body=await readJson(req),source=body?.source,sourceId=String(body?.sourceId||'');if(source!=='soundcloud'||!/^\d{1,30}$/.test(sourceId))throw badRequest('Некорректный трек');if(descriptorTasks.size){sendJson(res,202,{warming:false});return}getDescriptor(source,sourceId).catch(()=>{});sendJson(res,202,{warming:true});return;}
 
   if (route[0] === 'wave' && route[1] === 'stations') {
     // категории станций: жанры, настроения, занятия — из ротора Яндекса
@@ -1107,7 +1114,7 @@ function reasonMessage(reason) {
     const title = url.searchParams.get('title') || '';
     const artist = url.searchParams.get('artist') || '';
     if (!title) throw badRequest('Не указано название трека');
-    const items = await clips.searchClips({ title, artist });
+    const items = await clips.searchClips({ title, artist,duration:Number(url.searchParams.get('duration'))||0 });
     sendJson(res, 200, { ok: true, items });
     return;
   }

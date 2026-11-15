@@ -19,6 +19,7 @@ jobs:
       - run: npm run release:win
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOULROOM_PUBLISH: '1'
       - uses: actions/upload-artifact@v4
         with:
           name: soulroom-windows

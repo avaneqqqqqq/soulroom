@@ -1,12 +1,14 @@
 /** Isolated transport fixtures only: never make a real request or use account data. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {EventEmitter} from 'node:events';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = process.env.SOUNDCLOUD_CLIENT_ID;
 process.env.SOUNDCLOUD_CLIENT_ID = '';
 let instance = 0;
 const key = 'A'.repeat(32);
+class AudioSink extends EventEmitter{headers={};chunks=[];headersSent=false;writableEnded=false;setHeader(k,v){this.headers[k]=v}write(b){this.headersSent=true;this.chunks.push(Buffer.from(b));this.emit('chunk');return true}end(){this.writableEnded=true}destroy(){this.destroyed=true;this.emit('close')}}
 const json = data => new Response(JSON.stringify(data), { headers: { 'content-type': 'application/json' } });
 async function provider(relays = []) {
   const mod = await import(`./providers/soundcloud.mjs?media-test=${++instance}`);
@@ -249,3 +251,9 @@ test('automatic mode remembers relay and avoids repeating failed direct requests
   await sc.stream('1');const before=direct;await sc.stream('1');
   assert.equal(direct,before);assert.ok(relay>=4);
 });
+
+test('fast progressive starts before the rest of the file arrives and caches only complete audio',async()=>{const sc=await provider();let release;globalThis.fetch=fixture('progressive',()=>new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('ABC'));release=()=>{c.enqueue(new TextEncoder().encode('DEF'));c.close()}}}),{headers:{'content-type':'audio/mpeg','content-length':'6'}}));const sink=new AudioSink(),first=new Promise(r=>sink.once('chunk',r)),job=sc.streamFast('1',{headers:{}},sink);await first;assert.equal(Buffer.concat(sink.chunks).toString(),'ABC');assert.equal(sink.writableEnded,false);release();const d=await job;assert.equal(d.handled,true);assert.equal(d.buffer.toString(),'ABCDEF');assert.equal(sink.writableEnded,true)});
+
+test('fast MP3 HLS starts with the first segment while later segments are pending',async()=>{const sc=await provider();let release;globalThis.fetch=fixture('hls',url=>{const p=new URL(url).pathname;if(p==='/media')return Promise.resolve(new Response('#EXTM3U\n#EXTINF:5,\n/first.mp3\n#EXTINF:5,\n/second.mp3\n#EXT-X-ENDLIST'));if(p==='/first.mp3')return Promise.resolve(new Response('A'));return new Promise(r=>release=()=>r(new Response('B')))},'audio/mpeg');const sink=new AudioSink(),first=new Promise(r=>sink.once('chunk',r)),job=sc.streamFast('1',{headers:{}},sink);await first;assert.equal(Buffer.concat(sink.chunks).toString(),'A');assert.equal(sink.writableEnded,false);release();const d=await job;assert.equal(d.buffer.toString(),'AB');assert.equal(sink.writableEnded,true)});
+
+test('AAC-capable clients receive fMP4 init and first HLS segment before later segments',async()=>{const sc=await provider();let release;globalThis.fetch=fixture('hls',url=>{const p=new URL(url).pathname;if(p==='/media')return Promise.resolve(new Response('#EXTM3U\n#EXT-X-MAP:URI="/init.mp4"\n#EXTINF:5,\n/first.m4s\n#EXTINF:5,\n/second.m4s\n#EXT-X-ENDLIST'));if(p==='/init.mp4')return Promise.resolve(new Response('INIT'));if(p==='/first.m4s')return Promise.resolve(new Response('FIRST'));return new Promise(r=>release=()=>r(new Response('LAST')))},'audio/mp4');const sink=new AudioSink(),first=new Promise(r=>sink.once('chunk',r)),job=sc.streamFast('1',{headers:{}},sink,{supportsAac:true});await first;assert.equal(sink.headers['Content-Type'],'audio/mp4');assert.equal(sink.writableEnded,false);release();const d=await job;assert.equal(d.buffer.toString(),'INITFIRSTLAST');assert.equal(d.contentType,'audio/mp4')});
